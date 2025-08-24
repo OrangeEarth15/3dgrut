@@ -20,7 +20,7 @@
 threedgut::ErrorCode threedgut::Status::_lastError;
 
 threedgut::CudaBuffer::~CudaBuffer() {
-    if (m_owner && (m_size > 0)) {
+    if (m_owner && (m_size > 0)) { // 双重检查确保安全
         CudaMemoryAllocator::get().free(m_data, m_size);
     }
 }
@@ -38,7 +38,8 @@ void* threedgut::CudaBuffer::data() {
 }
 
 uint64_t threedgut::CudaBuffer::handle() const {
-    return reinterpret_cast<uint64_t>(m_data);
+    // handle() 返回内存地址的数值表示
+    return reinterpret_cast<uint64_t>(m_data); // 将指针转换为句柄
 }
 
 threedgut::Status threedgut::CudaBuffer::resize(size_t size, uint64_t processQueueHandle, const Logger& logger) {
@@ -61,7 +62,7 @@ threedgut::Status threedgut::CudaBuffer::enlarge(size_t size, uint64_t processQu
 
 threedgut::Status threedgut::CudaBuffer::setFromHost(const void* hostMemory, size_t size, uint64_t processQueueHandle, const Logger& logger) {
 
-    Status status = detach(false, processQueueHandle, logger);
+    Status status = detach(false, processQueueHandle, logger); // 分离外部内存引用
     if (!status) {
         return status;
     }
@@ -98,13 +99,16 @@ threedgut::Status threedgut::CudaBuffer::setFromDevice(const void* deviceMemory,
 }
 
 bool threedgut::CudaBuffer::attached() const {
-    return !m_owner;
+    return !m_owner; // attached = 不拥有所有权
 }
 
 threedgut::Status threedgut::CudaBuffer::detach(bool copy, uint64_t processQueueHandle, const Logger& logger) {
-    if (!attached()) {
+    if (!attached()) { // 相当于if(m_owner),如果拥有所有权
         return Status();
     }
+    // 第108行解释：三元运算符实现两种分离策略
+    // copy=true：复制数据后分离（保留数据）
+    // copy=false：直接清空（丢弃数据）
     return copy ? setFromDevice(m_data, m_size, false, processQueueHandle, logger) : clear(processQueueHandle, logger);
 }
 

@@ -17,6 +17,7 @@
 
 #ifdef __CUDACC__
 
+// TEA加密算法随机数生成器
 template <unsigned int N = 16>
 static __host__ __device__ __inline__ unsigned int tea(unsigned int val0, unsigned int val1) {
     unsigned int v0 = val0;
@@ -32,6 +33,7 @@ static __host__ __device__ __inline__ unsigned int tea(unsigned int val0, unsign
     return v0;
 }
 
+// 线性同余生成器，生成[0, 2^24)范围的无符号整数
 // Generate random unsigned int in [0, 2^24)
 static __host__ __device__ __inline__ unsigned int lcg(unsigned int& prev) {
     const unsigned int LCG_A = 1664525u;
@@ -40,12 +42,13 @@ static __host__ __device__ __inline__ unsigned int lcg(unsigned int& prev) {
     return prev & 0x00FFFFFF;
 }
 
+// 另一个线性同余生成器变体
 static __host__ __device__ __inline__ unsigned int lcg2(unsigned int& prev) {
     prev = (prev * 8121 + 28411) % 134456;
     return prev;
 }
 
-// Generate random float in [0, 1)
+// 生成[0, 1)范围的随机浮点数
 static __host__ __device__ __inline__ float rnd(unsigned int& prev) {
     return ((float)lcg(prev) / (float)0x01000000);
 }

@@ -53,7 +53,9 @@ def load_3dgut_plugin(conf):
 
 @dataclass
 class SensorPose3D:
+    # 两帧的[tquat]位姿（平移加四元数）
     T_world_sensors: list  # represents two tquat [t,q] poses
+    # 两个时间戳：微秒
     timestamps_us: list
 
 
@@ -71,15 +73,16 @@ class SensorPose3DModel:
         )
         # self.camera_center = self.world_view_transform.inverse()[3, :3].cpu()
 
-    @staticmethod
+    @staticmethod # __getWorld2View2，名称改写，类内私有字段
     def __getWorld2View2(R, t, translate=np.array([0.0, 0.0, 0.0]), scale=1.0):
         Rt = np.zeros((4, 4))
         Rt[:3, :3] = R.transpose()
         Rt[:3, 3] = t
         Rt[3, 3] = 1.0
-        C2W = np.linalg.inv(Rt)
+        C2W = np.linalg.inv(Rt) # 得到相机到世界的坐标变换矩阵
+        # 场景标准化变换，将相机中心平移到原点，并缩放到单位球
         cam_center = C2W[:3, 3]
-        cam_center = (cam_center + translate) * scale
+        cam_center = (cam_center + translate) * scale # 应用额外平移和缩放
         C2W[:3, 3] = cam_center
         Rt = np.linalg.inv(C2W)
         return np.float32(Rt)
@@ -87,6 +90,7 @@ class SensorPose3DModel:
     @staticmethod
     def __so3_matrix_to_quat(R: torch.Tensor | np.ndarray, unbatch: bool = True) -> torch.Tensor:
         """
+        旋转矩阵到四元数的转换函数
         Converts a singe / batch of SO3 rotation matrices (3x3) to unit quaternion representation.
 
         Args:
@@ -128,7 +132,7 @@ class SensorPose3DModel:
         quat[ind, 2] = R[ind, 1, 0] - R[ind, 0, 1]
         quat[ind, 3] = 1 + decision_matrix[ind, -1]
 
-        quat = quat / torch.norm(quat, dim=1)[:, None]
+        quat = quat / torch.norm(quat, dim=1)[:, None] # 确保四元数是单位四元数
 
         if unbatch:  # unbatch dimensions conditionally
             quat = quat.squeeze()
@@ -159,32 +163,33 @@ class Tracer:
     class _Autograd(torch.autograd.Function):
         @staticmethod
         def forward(
-            ctx,
-            tracer_wrapper,
-            frame_id,
-            n_active_features,
-            ray_ori,
+            ctx, # pytorch自动微分上下文
+            tracer_wrapper, # 底层C++/CUDA渲染器包装器
+            frame_id, # 当前渲染帧ID
+            n_active_features, # 颜色特征数目
+            ray_ori, 
             ray_dir,
             mog_pos,
             mog_rot,
-            mog_scl,
-            mog_dns,
-            mog_sph,
-            sensor_params,
-            sensor_poses,
+            mog_scl, # mixure of gaussians scale
+            mog_dns, # density
+            mog_sph, # 球谐函数系数
+            sensor_params, # 传感器参数
+            sensor_poses, # 传感器位姿
         ):
             particle_density = torch.concat(
                 [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
-            ).contiguous()
-            particle_radiance = mog_sph.contiguous()
+            ).contiguous() # 3+1+4+3+1=12
+            particle_radiance = mog_sph.contiguous() # 球谐函数系数，颜色特征
 
             ray_time = (
                 torch.ones(
                     (ray_ori.shape[0], ray_ori.shape[1], ray_ori.shape[2], 1), device=ray_ori.device, dtype=torch.long
                 )
                 * sensor_poses.timestamps_us[0]
-            )
+            ) # 创建光线时间戳：为每条光线分配相同的时间戳
 
+            # [二维投影信息，命中距离，命中次数，可见性]
             ray_radiance_density, ray_hit_distance, ray_hit_count, mog_visibility = tracer_wrapper.trace(
                 frame_id,
                 n_active_features,
@@ -200,16 +205,34 @@ class Tracer:
                 sensor_poses.T_world_sensors[1],
             )
 
+            # save_for_backward:专门用于张量
+            # save_for_backward() 的特殊功能：
+            # 自动微分图管理
+            # - PyTorch 会自动跟踪这些张量在计算图中的依赖关系
+            # - 确保反向传播时这些张量仍然可以计算梯度
+            # 内存优化
+            # - PyTorch 可能会对保存的张量进行内存优化
+            # - 避免不必要的内存占用
+            # 梯度检查
+            # - PyTorch 会检查哪些张量需要梯度 (requires_grad=True)
+            # - 只保存必要的梯度信息
             ctx.save_for_backward(
-                ray_ori,
-                ray_dir,
-                ray_time,
-                ray_radiance_density,
-                ray_hit_distance,
-                particle_density,
-                particle_radiance,
+                ray_ori, # 光线起点
+                ray_dir, # 光线方向
+                ray_time, # 光线时间戳
+                ray_radiance_density, # output1
+                ray_hit_distance, # output2
+                particle_density, # input1
+                particle_radiance, # input2
             )
 
+            # 直接赋值的特点：
+            # 简单对象存储
+            # - 适用于标量、字符串、自定义对象等
+            # - 不参与自动微分
+            # 无梯度跟踪
+            # - 这些对象不需要计算梯度
+            # - 只是在反向传播时提供配置信息
             ctx.frame_id = frame_id
             ctx.n_active_features = n_active_features
             ctx.sensor_params = sensor_params
@@ -289,6 +312,11 @@ class Tracer:
         self.device = "cuda"
         self.conf = conf
 
+        # 创建一个“空张量”，强制初始化CUDA上下文，防止后续cuda初始化延迟带来性能问题。
+        # CUDA延迟初始化
+        # - CUDA 采用延迟初始化策略
+        # - 只有当第一次在GPU上创建张量或执行运算时，才会初始化CUDA上下文
+        # - 这个初始化过程比较耗时（几百毫秒到几秒）
         torch.zeros(1, device=self.device)  # Create a dummy tensor to force cuda context init
         load_3dgut_plugin(conf)
 
@@ -305,6 +333,7 @@ class Tracer:
         rays_o = gpu_batch.rays_ori
         rays_d = gpu_batch.rays_dir
 
+        # 创建传感器参数和位姿
         sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
 
         num_gaussians = gaussians.num_gaussians
@@ -350,6 +379,9 @@ class Tracer:
             "mog_visibility": mog_visibility,
         }
 
+    # 焦距和视场角转换
+    # 焦距到视场角：fov = 2 * arctan(pixels / (2 * focal))
+    # 视场角到焦距：focal = pixels / (2 * tan(fov / 2))
     @staticmethod
     def __fov2focal(fov_radians: float, pixels: int):
         return pixels / (2 * math.tan(fov_radians / 2))
@@ -373,6 +405,9 @@ class Tracer:
         # Process the camera extrinsics
         pose = gpu_batch.T_to_world.squeeze()
         assert pose.ndim == 2
+        # np.concatenate: 将两个数组沿指定轴连接在一起，默认axis=0
+        # pose[:3, :4].cpu().detach().numpy(): 将张量转换为numpy数组
+        # np.zeros((1, 4)): 创建一个1行4列的零数组
         C2W = np.concatenate((pose[:3, :4].cpu().detach().numpy(), np.zeros((1, 4))))
         C2W[3, 3] = 1.0
 

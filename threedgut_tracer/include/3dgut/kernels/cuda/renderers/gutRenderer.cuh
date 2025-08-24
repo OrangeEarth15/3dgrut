@@ -18,6 +18,7 @@
 #include <3dgut/kernels/cuda/common/rayPayload.cuh>
 #include <3dgut/renderer/gutRendererParameters.h>
 
+// 粒子投影到瓦片的CUDA内核
 __global__ void projectOnTiles(tcnn::uvec2 tileGrid,
                                uint32_t numParticles,
                                tcnn::ivec2 resolution,
@@ -51,6 +52,7 @@ __global__ void projectOnTiles(tcnn::uvec2 tileGrid,
                         {parameterMemoryHandles});
 }
 
+// 展开瓦片投影的CUDA内核
 __global__ void expandTileProjections(tcnn::uvec2 tileGrid,
                                       uint32_t numParticles,
                                       tcnn::ivec2 resolution,
@@ -80,6 +82,7 @@ __global__ void expandTileProjections(tcnn::uvec2 tileGrid,
                           unsortedTileParticleIdxPtr);
 }
 
+// 主渲染CUDA内核
 __global__ void render(threedgut::RenderParameters params,
                        const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
                        const uint32_t* __restrict__ sortedTileDataPtr,
@@ -114,6 +117,7 @@ __global__ void render(threedgut::RenderParameters params,
     finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
 }
 
+// 反向渲染CUDA内核
 __global__ void renderBackward(threedgut::RenderParameters params,
                                const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
                                const uint32_t* __restrict__ sortedTileDataPtr,
@@ -164,6 +168,7 @@ __global__ void renderBackward(threedgut::RenderParameters params,
                                {parameterGradientMemoryHandles});
 }
 
+// 反向投影CUDA内核
 __global__ void projectBackward(tcnn::uvec2 tileGrid,
                                 uint32_t numParticles,
                                 tcnn::ivec2 resolution,

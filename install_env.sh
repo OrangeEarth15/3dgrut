@@ -86,13 +86,22 @@ if [ "$WITH_GCC11" = true ]; then
 fi
 
 # Create and activate conda environment
-eval "$(conda shell.bash hook)"
+# Auto-detect shell type and use appropriate conda hook
+CURRENT_SHELL=$(basename "$SHELL")
+if [ "$CURRENT_SHELL" = "zsh" ]; then
+    eval "$(conda shell.zsh hook)"
+elif [ "$CURRENT_SHELL" = "fish" ]; then
+    eval "$(conda shell.fish hook)"
+else
+    # Default to bash for other shells
+    eval "$(conda shell.bash hook)"
+fi
 
 # Finds the path of the environment if the environment already exists
 CONDA_ENV_PATH=$(conda env list | sed -E -n "s/^${CONDA_ENV}[[:space:]]+\*?[[:space:]]*(.*)$/\1/p")
 if [ -z "${CONDA_ENV_PATH}" ]; then
   echo "Conda environment '${CONDA_ENV}' not found, creating it"
-  conda create --name ${CONDA_ENV} -y python=3.11
+  conda create --name ${CONDA_ENV} -y python=3.11 --force
 else
   echo "NOTE: Conda environment '${CONDA_ENV}' already exists at ${CONDA_ENV_PATH}, skipping environment creation"
 fi
@@ -124,8 +133,8 @@ conda activate $CONDA_ENV
 # CUDA 11.8 supports until compute capability 9.0
 if [ "$CUDA_VERSION" = "11.8.0" ]; then
     echo "Installing CUDA 11.8.0 ..."
-    conda install -y cuda-toolkit cmake ninja -c nvidia/label/cuda-11.8.0
-    conda install -y pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=11.8 "numpy<2.0" -c pytorch -c nvidia/label/cuda-11.8.0
+    conda install -y cuda-toolkit cmake ninja -c nvidia/label/cuda-11.8.0 --force --no-update-deps
+    conda install -y pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=11.8 "numpy<2.0" -c pytorch -c nvidia/label/cuda-11.8.0 --force
     pip3 install --find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.2_cu118.html kaolin==0.17.0
 
 # CUDA 12.8 supports compute capability 10.0 and 12.0
@@ -141,7 +150,7 @@ elif [ "$CUDA_VERSION" = "12.8.1" ]; then
     gcc_version=$($GCC_11_PATH -dumpversion | cut -d '.' -f 1)
 
     echo "Installing CUDA 12.8.1 ..."
-    conda install -y cuda-toolkit cmake ninja gcc_linux-64=$gcc_version -c nvidia/label/cuda-12.8.1
+    conda install -y cuda-toolkit cmake ninja gcc_linux-64=$gcc_version -c nvidia/label/cuda-12.8.1 --force --no-update-deps
     pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
     pip3 install --force-reinstall "numpy<2"
 
@@ -151,9 +160,9 @@ elif [ "$CUDA_VERSION" = "12.8.1" ]; then
     pushd thirdparty/kaolin
     git checkout c2da967b9e0d8e3ebdbd65d3e8464d7e39005203  # ping to a fixed commit for reproducibility
     sed -i 's!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.type()!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.scalar_type()!g' kaolin/csrc/render/spc/raytrace_cuda.cu
-    pip install --upgrade pip
-    pip install --no-cache-dir ninja imageio imageio-ffmpeg
-    pip install --no-cache-dir        \
+    python -m pip install --upgrade pip
+    python -m pip install --no-cache-dir ninja imageio imageio-ffmpeg
+    python -m pip install --no-cache-dir        \
         -r tools/viz_requirements.txt \
         -r tools/requirements.txt     \
         -r tools/build_requirements.txt
@@ -168,11 +177,11 @@ else
 fi
 
 # Install OpenGL headers for the playground
-conda install -c conda-forge mesa-libgl-devel-cos7-x86_64 -y 
+conda install -c conda-forge mesa-libgl-devel-cos7-x86_64 -y --force 
 
 # Initialize git submodules and install Python requirements
 git submodule update --init --recursive
-pip install -r requirements.txt
-pip install -e .
+python -m pip install -r requirements.txt
+python -m pip install -e .
 
 echo "Setup completed successfully!"

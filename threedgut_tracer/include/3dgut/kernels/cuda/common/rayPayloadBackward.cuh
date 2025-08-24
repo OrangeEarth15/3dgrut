@@ -17,6 +17,7 @@
 
 #include <3dgut/kernels/cuda/common/rayPayload.cuh>
 
+// 反向传播光线数据结构，继承基础光线数据并添加梯度信息
 template <int FeatN>
 struct RayPayloadBackward : public RayPayload<FeatN> {
     float transmittanceBackward;
@@ -27,6 +28,7 @@ struct RayPayloadBackward : public RayPayload<FeatN> {
     tcnn::vec<FeatN> featuresGradient;
 };
 
+// 初始化反向传播光线，设置梯度信息
 template <typename RayPayloadT>
 __device__ __inline__ RayPayloadT initializeBackwardRay(const threedgut::RenderParameters& params,
                                                         const tcnn::vec3* __restrict__ sensorRayOriginPtr,

@@ -15,12 +15,12 @@
 
 #pragma once
 
-#include <3dgut/renderer/renderParameters.h>
-#include <3dgut/utils/cuda/cudaBuffer.h>
+#include <3dgut/renderer/renderParameters.h> // 渲染参数定义（相机、场景、输出配置）
+#include <3dgut/utils/cuda/cudaBuffer.h> // GPU内存管理工具类
 
-#include <json/json.hpp>
+#include <json/json.hpp> // nlohmann::json库，用于配置文件解析
 
-#include <memory>
+#include <memory> // 智能指针支持（std::unique_ptr）
 
 namespace threedgut {
 
@@ -30,31 +30,35 @@ public:
 
     struct Parameters {
         struct {
-            uint32_t numParticles;
-            int radianceSphDegree;
-        } values;
+            uint32_t numParticles; // 粒子数量
+            int radianceSphDegree; // 球谐函数阶数
+        } values; // 存储渲染过程中的标量参数，这些值会被传输到GPU常量内存。
 
         struct {
-            void* dptrValuesBuffer;
-            void* dptrDensityParameters;
-            void* dptrRadianceParameters;
-        } parameters;
+            void* dptrValuesBuffer; // 粒子属性值缓冲区指针
+            void* dptrDensityParameters; // 密度参数缓冲区指针
+            void* dptrRadianceParameters; // 辐射参数缓冲区指针
+        } parameters; // 参数缓冲区（全局参数、密度参数、辐射参数）
 
         struct {
-            void* dptrDensityGradients;
-            void* dptrRadianceGradients;
-        } gradients;
+            void* dptrDensityGradients; // 密度梯度缓冲区指针
+            void* dptrRadianceGradients; // 辐射梯度缓冲区指针
+        } gradients; // 梯度缓冲区（密度梯度、辐射梯度）
 
-        threedgut::CudaBuffer parametersBuffer;
-        threedgut::CudaBuffer gradientsBuffer;
-        threedgut::CudaBuffer valuesBuffer;
+        // CUDA缓冲区管理，RAII内存管理对象，自动管理GPU内存的生命周期
+        threedgut::CudaBuffer parametersBuffer; // 参数缓冲区（全局参数、密度参数、辐射参数）
+        threedgut::CudaBuffer gradientsBuffer; // 梯度缓冲区（密度梯度、辐射梯度）
+        threedgut::CudaBuffer valuesBuffer; // 粒子属性值缓冲区
 
-        uint64_t* m_dptrParametersBuffer = nullptr;
-        uint64_t* m_dptrGradientsBuffer  = nullptr;
+        // 指针数组
+        uint64_t* m_dptrParametersBuffer = nullptr; // 参数缓冲区指针
+        uint64_t* m_dptrGradientsBuffer  = nullptr; // 梯度缓冲区指针
     };
 
 private:
     Logger m_logger;
+    // Context = "上下文" = "执行环境的状态快照"
+    // 它包含了某个操作过程中需要的所有相关信息，就像一个"工作台"，上面放着完成任务所需的所有工具和材料。
     std::unique_ptr<GutRenderForwardContext> m_forwardContext;
 
 public:

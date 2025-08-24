@@ -17,6 +17,7 @@
 
 #include <3dgut/renderer/renderParameters.h>
 
+// 球谐高斯模型模板结构体
 template <typename TParticles>
 struct ShGaussian {
 

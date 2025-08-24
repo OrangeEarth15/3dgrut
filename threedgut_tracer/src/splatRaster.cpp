@@ -27,13 +27,13 @@
 #include <torch/extension.h>
 #endif
 
-#include <3dgut/splatRaster.h>
+#include <3dgut/splatRaster.h> // 3DGUT渲染器接口
 
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAUtils.h>
+#include <ATen/cuda/CUDAContext.h> // Pytorch CUDA上下文
+#include <ATen/cuda/CUDAUtils.h> 
 #include <c10/core/ScalarType.h>
 
-#include <cuda_runtime.h>
+#include <cuda_runtime.h> // CUDA运行时API
 
 #include <algorithm>
 #include <fstream>
@@ -55,6 +55,7 @@ using namespace threedgut;
 namespace {
 
 static void THREEDGUT_LOGGER_CB logCallback(uint8_t level, const char* msg, void* data) {
+    // 实现分级日志功能
     std::ostream& stream = (level > LoggerParameters::Error) ? std::cout : std::cerr;
     stream << "[3dgut][" << LoggerParameters::levelToString(level) << "] ::: "
            << msg << std::flush << std::endl;
@@ -65,13 +66,14 @@ static void THREEDGUT_LOGGER_CB logCallback(uint8_t level, const char* msg, void
 //------------------------------------------------------------------------------
 // SplatRaster
 //------------------------------------------------------------------------------
+// 用来将 PyTorch 的张量（torch::Tensor）根据它的数据类型安全地获取对应的裸指针（void*），方便传递给CUDA或底层C++代码进行高性能计算
 inline void* voidDataPtr(torch::Tensor& tensor) {
     if (tensor.size(0) == 0) {
         return nullptr;
     }
     switch (tensor.scalar_type()) {
     case torch::kFloat32:
-        return tensor.contiguous().data_ptr<float>();
+        return tensor.contiguous().data_ptr<float>(); // 保证类型连续性
     case torch::kHalf:
         return tensor.contiguous().data_ptr<torch::Half>();
     case torch::kInt32:
@@ -83,12 +85,14 @@ inline void* voidDataPtr(torch::Tensor& tensor) {
     // case torch::kUInt64:
     //     return tensor.contiguous().data_ptr<uint64_t>();
     default:
+        // const char* + const char*会报错
         throw std::runtime_error{"[3dgut] Unknown precision torch->void: " + std::string(c10::toString(tensor.scalar_type()))};
     }
 }
 
 using DeviceQueueHandle = uint64_t;
 
+// using TSensorPose = tcnn::vec<7>; // 3D position and 3D quaternion (x,y,z,w)
 threedgut::TSensorPose poseInverse(const TSensorPose& pose) {
     static_assert(sizeof(TSensorPose) == sizeof(threedgut::TSensorPose));
     const threedgut::TSensorPose iPose = threedgut::sensorPoseInverse({pose.elems[0], pose.elems[1], pose.elems[2], pose.elems[3], pose.elems[4], pose.elems[5], pose.elems[6]});
@@ -106,8 +110,8 @@ TSensorState toSensorState(threedgut::TTimestamp startTs, torch::Tensor sensorsS
 }
 
 struct SplatRaster::CudaTimer {
-    const char* _tag;
-    cudaStream_t _stream;
+    const char* _tag; // 这只是一种命名约定，表示这些成员变量是类的私有或内部使用变量，提醒代码阅读者“这是内部实现细节，不建议外部直接访问”。
+    cudaStream_t _stream; // 但是不会实现语言层面的私有效果
     cudaEvent_t _start = 0, _stop = 0;
     bool _valid = false, _stopped = false;
 
@@ -140,9 +144,9 @@ struct SplatRaster::CudaTimer {
     }
 
     float collect() {
-        float milliseconds = 1e09f;
+        float milliseconds = 1e09f; // 默认值很大，在失败的时候很容易发现这是错误值
         if (_valid) {
-            stop();
+            stop(); // 调用stop()方法，记录结束时间
             cudaEventSynchronize(_stop);
             cudaEventElapsedTime(&milliseconds, _start, _stop);
         }
@@ -152,12 +156,16 @@ struct SplatRaster::CudaTimer {
 
 SplatRaster::SplatRaster(const nlohmann::json& config)
     : m_logLevel(static_cast<uint8_t>(LoggerParameters::Debug))
-    , m_logger(LoggerParameters{m_logLevel, logCallback, nullptr, nullptr, nullptr})
+    , m_logger(LoggerParameters{m_logLevel, logCallback, nullptr, nullptr, nullptr}) // 日志等级、日志回调函数、日志回调数据、设备启动回调函数、设备启动回调数据
     , m_renderer(std::make_unique<GUTRenderer>(config, m_logger)) {
 
     const auto& renderConfig = config["render"];
+    // value()方法：nlohmann::json的安全访问方法
+    // 默认值 false：如果配置文件中没有该选项，默认禁用计时
+    // 性能考虑：计时功能会带来微小的性能开销，默认关闭
     m_enableKernelTimings    = renderConfig.value("enable_kernel_timings", false);
 
+    // threedgut::GUTRenderer::Parameters m_parameters; // 渲染参数，用于配置渲染行为
     m_parameters.valuesBuffer.resize(sizeof(m_parameters.values), 0, m_logger);
     m_parameters.parametersBuffer.resize(sizeof(m_parameters.parameters), 0, m_logger);
     m_parameters.gradientsBuffer.resize(sizeof(m_parameters.gradients), 0, m_logger);
@@ -208,7 +216,7 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
     std::shared_ptr<CudaTimer> timer;
     if (m_enableKernelTimings) {
         timer = std::make_shared<CudaTimer>("forward_render", cudaStream);
-        m_timers.emplace_back(timer);
+        m_timers.emplace_back(timer); // m_timers是双端队列
         // keep only the last m_maxNumTimers timers
         if (m_timers.size() > m_maxNumTimers) {
             m_timers.pop_front();

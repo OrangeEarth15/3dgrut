@@ -21,11 +21,11 @@ struct GUTParameters {
     struct Tiling {
         static constexpr uint32_t BlockX         = 16;
         static constexpr uint32_t BlockY         = 16;
-        static constexpr uint32_t InvalidTileIdx = -1U;
+        static constexpr uint32_t InvalidTileIdx = -1U; // 无效的tile索引
         static constexpr uint32_t BlockSize      = BlockX * BlockY;
         static constexpr uint32_t WarpSize       = 32;
         static constexpr uint32_t NumWarps       = BlockSize / WarpSize;
-        static constexpr uint32_t WarpMask       = 0xFFFFFFFFU;
+        static constexpr uint32_t WarpMask       = 0xFFFFFFFFU; // U后缀代表unsigned
     };
 
     static constexpr uint32_t InvalidParticleIdx = -1U;

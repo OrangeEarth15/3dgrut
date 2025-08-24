@@ -39,10 +39,11 @@ namespace {
 using namespace threedgut;
 
 constexpr int featuresDim() {
-    return model_ExternalParams::FeaturesDim;
+    return model_ExternalParams::FeaturesDim; // 外部算法参数，3
 }
 
 // identify tiles start/end indices in the sorted tile/depth keys buffer
+// 计算排序后tile的范围索引（guassian粒子范围的开始和结束）
 __global__ void computeSortedTileRangeIndices(
     int numKeys,
     const uint64_t* __restrict__ sortedTileDepthKeys,
@@ -54,7 +55,7 @@ __global__ void computeSortedTileRangeIndices(
     }
 
     const uint32_t tileIdx = sortedTileDepthKeys[keyIdx] >> 32;
-    const bool validTile   = tileIdx != GUTParameters::Tiling::InvalidTileIdx;
+    const bool validTile   = tileIdx != GUTParameters::Tiling::InvalidTileIdx; // 初始值为-1U
     if (keyIdx == 0) {
         if (validTile) {
             tileRangeIndices[tileIdx].x = keyIdx;
@@ -76,6 +77,7 @@ __global__ void computeSortedTileRangeIndices(
 }
 
 // TODO : review this
+// 计算n的最高有效位（MSB，Most Significant Bit），即n的二进制表示中最高位1的位置
 inline uint32_t higherMsb(uint32_t n) {
     uint32_t msb  = sizeof(n) * 4;
     uint32_t step = msb;
@@ -96,16 +98,19 @@ inline uint32_t higherMsb(uint32_t n) {
 } // namespace
 
 // TODO : per-stream n context cache
+// 渲染前向上下文，用于存储渲染过程中需要用到的缓冲区
 struct GUTRenderer::GutRenderForwardContext {
-    cudaStream_t cudaStream;
+    cudaStream_t cudaStream; // 声明流变量，用于管理异步GPU操作的执行顺序
 
     GutRenderForwardContext(cudaStream_t iCudaStream)
         : cudaStream(iCudaStream) {
     }
 
     ~GutRenderForwardContext() {
-        const uint64_t processQueueHandle = reinterpret_cast<uint64_t>(cudaStream);
+        // 句柄是一个抽象的标识符，用来引用系统资源而不是直接使用资源的实际地址或指针。它就像是一张"提货单"或"钥匙"，让你能够访问某个资源，但不直接暴露资源的内部实现细节。
+        const uint64_t processQueueHandle = reinterpret_cast<uint64_t>(cudaStream); // 将cudaStream转换为uint64_t类型
         Logger logger;
+        // 清除缓冲区，释放GPU内存
         unsortedTileDepthKeys.clear(processQueueHandle, logger);
         sortedTileDepthKeys.clear(processQueueHandle, logger);
         sortedTileRangeIndices.clear(processQueueHandle, logger);
@@ -126,12 +131,12 @@ struct GUTRenderer::GutRenderForwardContext {
         scanningWorkingBuffer.clear(processQueueHandle, logger);
     }
 
-    CudaBuffer unsortedTileDepthKeys;
-    CudaBuffer sortedTileDepthKeys;
-    CudaBuffer sortedTileRangeIndices;
-    CudaBuffer unsortedTileParticleIdx;
-    CudaBuffer sortedTileParticleIdx;
-    CudaBuffer sortingWorkingBuffer;
+    CudaBuffer unsortedTileDepthKeys; // 未排序的tile深度键
+    CudaBuffer sortedTileDepthKeys; // 排序后的tile深度键
+    CudaBuffer sortedTileRangeIndices; // 排序后的tile范围索引
+    CudaBuffer unsortedTileParticleIdx; // 未排序的粒子索引
+    CudaBuffer sortedTileParticleIdx; // 排序后的粒子索引
+    CudaBuffer sortingWorkingBuffer; // 排序工作缓冲区
 
     Status updateTileSortingBuffers(const uvec2& tileGrid, int numKeys, cudaStream_t stream, const Logger& logger) {
         const uint64_t queueHandle = reinterpret_cast<uint64_t>(stream);
@@ -332,6 +337,9 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
 
     {
         const auto expandProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render::expand"};
+        // ::表示全局作用域操作符，::expandTileProjections 指的是全局命名空间中的函数
+        // 不是某个类的成员函数，而是一个自由函数
+        // 在CUDA中，这通常是一个global kernel函数
         ::expandTileProjections<<<div_round_up(numParticles, GUTParameters::Tiling::BlockSize), GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
             tileGrid,
             numParticles,
@@ -365,6 +373,14 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                       m_logger);
 
     // Compute the tile range indices in the sorted keys
+    // #if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
+    // template <typename K, typename T, typename ... Types>
+    // inline void linear_kernel(K kernel, uint32_t shmem_size, cudaStream_t stream, T n_elements, Types ... args) {
+    //     if (n_elements <= 0) {
+    //         return;
+    //     }
+    //     kernel<<<n_blocks_linear(n_elements), N_THREADS_LINEAR, shmem_size, stream>>>(n_elements, args...);
+    // }
     linear_kernel(
         computeSortedTileRangeIndices, /*shmem=*/0, cudaStream,
         numParticleTileIntersections,
@@ -377,7 +393,7 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
     {
         const auto renderProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render::render"};
         ::render<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
-            params,
+            params, // threedgut::RenderParameters params
             (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
             (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
             (const tcnn::vec3*)sensorRayOriginCudaPtr,
@@ -393,7 +409,6 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             parameters.m_dptrParametersBuffer);
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }
-
     return Status();
 }
 
@@ -492,6 +507,5 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
             parameters.m_dptrGradientsBuffer);
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }
-
     return Status();
 }

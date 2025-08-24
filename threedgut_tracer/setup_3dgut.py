@@ -22,7 +22,7 @@ from threedgrut.utils import jit
 # ----------------------------------------------------------------------------
 #
 def setup_3dgut(conf):
-
+    # 获取 / 创建当前项目的编译输出目录，如 build/lib3dgut_cc，后续所有编译结果都写到这里（临时/缓存文件/头文件等）
     build_dir = torch.utils.cpp_extension._get_build_directory("lib3dgut_cc", verbose=True)
 
     include_paths = []
@@ -31,7 +31,7 @@ def setup_3dgut(conf):
     include_paths.append(os.path.join(prefix, "..", "thirdparty", "tiny-cuda-nn", "include"))
     include_paths.append(os.path.join(prefix, "..", "thirdparty", "tiny-cuda-nn", "dependencies"))
     include_paths.append(os.path.join(prefix, "..", "thirdparty", "tiny-cuda-nn", "dependencies", "fmt", "include"))
-    include_paths.append(build_dir)
+    include_paths.append(build_dir) # build_dir也加入，确保自动生成的头文件可被找到
 
     # Compiler options.
 
@@ -76,10 +76,12 @@ def setup_3dgut(conf):
 
     cuda_cflags = [
         "-DTCNN_MIN_GPU_ARCH=70",
+        # 禁用CUDA的某些功能，以确保兼容性
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
+        # 开启CUDA高性能选项
         "-use_fast_math", "-O3",
         *defines,
     ]
@@ -96,15 +98,15 @@ def setup_3dgut(conf):
     # TODO: do not overwrite files, use config hash to register the needed version
     import importlib, subprocess
 
-    slang_mod = importlib.import_module("slangtorch")
-    slang_dir = os.path.dirname(slang_mod.__file__)
+    slang_mod = importlib.import_module("slangtorch") # 动态导入指定名称的模块，比import slangtorch更安全
+    slang_dir = os.path.dirname(slang_mod.__file__) # 获取模块安装目录
 
     slang_build_env = os.environ
     slang_build_env["PATH"] += ";" if os.name == "nt" else ":"
     slang_build_env["PATH"] += os.path.join(slang_dir, "bin")
     slang_build_inc_dir = os.path.join(os.path.dirname(__file__), "include", "3dgut")
 
-    subprocess.check_call(
+    subprocess.check_call( # 执行外部命令并等待完成
         [
             "slangc", "-target", "cuda",
             "-I", os.path.join(os.path.dirname(__file__), "include"),

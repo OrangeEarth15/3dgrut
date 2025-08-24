@@ -20,9 +20,12 @@ namespace gaussianParticle
     static const float MaxParticleAlpha = GAUSSIAN_PARTICLE_MAX_ALPHA;
     static const float MinParticleAlpha = GAUSSIAN_PARTICLE_MIN_ALPHA;
     static const bool EnableNormal = false;
-    static const bool Surfel = false;
+    static const bool Surfel = false; // 表面元素模式，默认关闭，如果开启，粒子视为表面片
 };
 
+// 高斯粒子的数学定义
+// 投影和混合算法
+// GPU优化的计算核心
 #include <3dgut/kernels/slang/models/gaussianParticles.slang>
 
 namespace shRadiativeParticle

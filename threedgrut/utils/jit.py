@@ -16,22 +16,22 @@
 import os, math
 import torch
 import torch.utils.cpp_extension
-from torch.utils.cpp_extension import CUDA_HOME
+from torch.utils.cpp_extension import CUDA_HOME # CUDA_HOME 是 PyTorch 提供的变量，指向本机 CUDA 安装目录（用于编译时找到CUDA库和头文件）。
 
 
 def load(
-    extra_cflags=None,
-    extra_cuda_cflags=None,
-    extra_ldflags=None,
-    extra_include_paths=None,
-    with_cuda=True,
-    verbose=True,
+    extra_cflags=None, # 额外的C++编译选项
+    extra_cuda_cflags=None, # 额外的CUDA编译选项
+    extra_ldflags=None, # 额外的链接器选项
+    extra_include_paths=None, # 额外的头文件路径
+    with_cuda=True, # 是否使用CUDA（GPU）编译
+    verbose=True, # 是否打印详细的编译信息
     *args,
     **kwargs,
 ):
 
     # Make sure we can find the necessary compiler and libary binaries.
-    if os.name == "nt":
+    if os.name == "nt": # 如果是Windows系统
 
         def find_cl_path():
             import glob
@@ -56,7 +56,7 @@ def load(
                 )
             os.environ["PATH"] += ";" + cl_path
 
-    elif os.name == "posix":
+    elif os.name == "posix": # 如果是Linux系统/Mac系统
         pass
 
     # Compiler flags.
@@ -71,11 +71,11 @@ def load(
         cflags += extra_cflags
 
     cuda_cflags = [
-        "-DNVDR_TORCH",
+        "-DNVDR_TORCH", # -短选项，定义宏 NVDR_TORCH，类似于在代码里写 #define NVDR_TORCH。
         "-std=c++17",
-        "--extended-lambda",
-        "--expt-relaxed-constexpr",
-        "-Xcompiler=-fno-strict-aliasing",
+        "--extended-lambda", # 允许使用 CUDA 扩展的 Lambda 表达式特性。
+        "--expt-relaxed-constexpr", # 作用：允许更宽松的 constexpr（编译期常量计算）的支持。
+        "-Xcompiler=-fno-strict-aliasing", # 给主机 C++ 编译器传递额外参数 -fno-strict-aliasing。
     ]
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
@@ -87,8 +87,8 @@ def load(
             f"-L{os.path.join(CUDA_HOME, 'lib', 'stubs')}",
             f"-L{os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'lib')}",
             f"-L{os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'lib', 'stubs')}",
-            "-lcuda",
-            "-lnvrtc",
+            "-lcuda", # 链接 CUDA 驱动库 libcuda.so，提供GPU驱动接口。
+            "-lnvrtc", # 链接 NVIDIA Runtime Compilation 库 libnvrtc.so，支持运行时编译 CUDA 代码。
         ]
     elif os.name == "nt":
         ldflags = [

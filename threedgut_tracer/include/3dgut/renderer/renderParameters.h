@@ -33,12 +33,16 @@ struct MemoryHandles {
 };
 
 struct RenderParameters {
-    uint32_t id;
-    tcnn::ivec2 resolution;
-    float hitTransmittance;
-    threedgut::BoundingBox objectAABB;
-    TSensorModel sensorModel;
-    TSensorState sensorState;
+    uint32_t id; // 渲染id
+    tcnn::ivec2 resolution; // 分辨率
+    float hitTransmittance; // 命中传输
+    threedgut::BoundingBox objectAABB; // 对象包围盒
+    // sensor.py
+    // using TSensorPose = tcnn::vec<7>; // 3D position and 3D quaternion (x,y,z,w)
+    //using TSensorModel = CameraModelParameters;
+
+    TSensorModel sensorModel; // 传感器模型
+    TSensorState sensorState; // 传感器状态
     // tcnn::mat4x3 colorCorrectionMatrix;
 };
 
