@@ -40,7 +40,8 @@ namespace gaussianParticle {
  * 
  * 注意：四元数使用(w,x,y,z)顺序，其中w是实部。
  */
-struct RawParameters : IDifferentiable {
+ // IDifferentiable声明这个结构体支持自动微分
+struct RawParameters : IDifferentiable { // 3 + 1 + 4 + 3 + 1 = 12
     float3 position;    // 粒子3D位置坐标（世界空间）
     float density;      // 粒子密度（不透明度，控制透射率）
     float4 quaternion;  // 粒子旋转四元数 (w,x,y,z)，单位四元数
@@ -63,9 +64,6 @@ struct RawParametersBuffer {
 
 /**
  * 通用参数包装结构
- * 
- * 包含渲染和计算所需的全局配置参数。
- * 提供统一的接口供外部调用。
  */
 struct CommonParameters {
     RawParametersBuffer parametersBuffer;  // 参数缓冲区管理器
@@ -73,14 +71,17 @@ struct CommonParameters {
 
 /**
  * 从缓冲区获取原始粒子参数的前向函数
- * 
+ *
  * 根据粒子索引从全局缓冲区中获取原始参数。
  * 支持Surfel模式，在该模式下将Z轴缩放设为极小值以实现2D面片效果。
- * 
+ *
  * @param particleIdx 粒子索引（不参与微分计算）
  * @param parametersBuffer 参数缓冲区（不参与微分计算）
  * @return 获取的原始参数（可能经Surfel模式修改）
  */
+ //[BackwardDifferentiable] 含义：声明此函数支持反向自动微分
+ // 作用：Slang 编译器会自动生成对应的梯度计算代码
+ // 实际效果：训练时可以自动计算参数梯度，无需手写求导
 [BackwardDifferentiable][ForceInline] RawParameters fetchParametersFromBuffer(
     no_diff uint32_t particleIdx,              // 粒子索引（不参与微分）
     no_diff RawParametersBuffer parametersBuffer) {  // 参数缓冲区（不参与微分）
@@ -88,7 +89,7 @@ struct CommonParameters {
     // 从全局缓冲区读取指定粒子的参数
     RawParameters rawParameters = parametersBuffer._dataPtr[particleIdx];
     
-    // Surfel模式：将三维高斯椒球压缩为二维面片
+    // Surfel模式：将三维高斯球压缩为二维面片
     if (Surfel) {
         rawParameters.scale.z = 1e-06f;  // 将Z轴厚度设为接近0（极薄面片）
     }
@@ -97,14 +98,17 @@ struct CommonParameters {
 
 /**
  * fetchParametersFromBuffer函数的反向传播版本
- * 
+ *
  * 实现参数获取的梯度反向传播，将从后续计算传回的梯度累加到全局梯度缓冲区。
  * 对Surfel模式做特殊处理，不更新Z轴缩放梯度。
- * 
+ *
  * @param particleIdx 粒子索引
  * @param parametersBuffer 参数缓冲区
  * @param rawParameters 从后续计算传回的梯度
  */
+// 模式1:自动生成梯度（只需 [BackwardDifferentiable]）
+// 模式2:自定义梯度逻辑（需要成对出现[BackwardDerivativeOf(xxx)]和[BackwardDifferentiable]）
+
 [BackwardDerivativeOf(fetchParametersFromBuffer)][ForceInline] void fetchParametersFromBufferBwd(
     no_diff uint32_t particleIdx,              // 粒子索引
     no_diff RawParametersBuffer parametersBuffer,  // 参数缓冲区
@@ -183,7 +187,7 @@ struct Parameters : IDifferentiable {
  * 将世界空间射线转换为粒子局部空间的标准化射线
  * 
  * 这是高斯相交测试的核心步骤：将任意射线转换到单位球空间，
- * 这样可以用统一的算法处理不同形状和大小的高斯椒球。
+ * 这样可以用统一的算法处理不同形状和大小的高斯球。
  * 
  * 变换步骤：
  * 1. 平移：将射线移动到以粒子为原点的坐标系
@@ -203,7 +207,7 @@ struct Parameters : IDifferentiable {
     out float3 particleRayOrigin,
     out float3 particleRayDirection, ) {
     
-    // 1. 计算缩放因子的倒数（用于将椒球标准化为单位球）
+    // 1. 计算缩放因子的倒数（用于将高斯椭球标准化为单位球）
     const float3 giscl  = float3(1.0f) / parameters.scale;
     
     // 2. 平移：射线起点相对于粒子中心的位置
@@ -212,7 +216,7 @@ struct Parameters : IDifferentiable {
     // 3. 旋转：应用旋转矩阵转置将射线转换到粒子的局部坐标系
     const float3 gposcr = mul(parameters.rotationT, gposc);
     
-    // 4. 缩放：按比例缩放，将椒球标准化为单位球
+    // 4. 缩放：按比例缩放，将高斯椭球标准化为单位球
     particleRayOrigin   = giscl * gposcr;
 
     // 对射线方向进行相同的旋转和缩放变换
@@ -225,7 +229,7 @@ struct Parameters : IDifferentiable {
  * 计算标准化空间中射线到原点的最小平方距离
  * 
  * 在标准化的单位球空间中，计算射线到球心（原点）的最小距离的平方。
- * 这个距离用于判断射线是否与高斯椒球相交。
+ * 这个距离用于判断射线是否与高斯椭球相交。
  * 
  * 算法：使用向量叉积计算点到直线的距离
  * |cross(direction, origin)| = |origin| * sin(θ)
@@ -522,16 +526,16 @@ bool hit(
 
 /**
  * 积分单次相交结果（体积渲染混合）
- * 
+ *
  * 实现体积渲染中单个粒子的贡献积分。支持两种混合模式：
  * 1. 前向后模式：用于正向穿越，直接累加权重值
  * 2. 后向前模式：用于Over混合，使用线性插值
- * 
+ *
  * 这个函数处理：
  * - 深度积分（用于Z-buffer或距离估计）
  * - 法线积分（用于光照计算）
  * - 透射率更新（控制后续粒子的影响）
- * 
+ *
  * @param alpha 当前粒子的不透明度
  * @param transmittance 输入输出：累积透射率
  * @param depth 当前粒子的深度
@@ -541,6 +545,8 @@ bool hit(
  * @param integratedNormal 输入输出：累积法线
  * @return 当前粒子的混合权重
  */
+// Slang	<let T : type>	func<let N : int>()
+// C++ template <> template <int N> func()
 [BackwardDifferentiable][ForceInline]
 float integrateHit<let backToFront : bool>(
     in float alpha,
@@ -579,6 +585,41 @@ float integrateHit<let backToFront : bool>(
    return weight;  // 返回当前粒子的实际混合权重
 }
 
+/**
+ * 处理射线与高斯粒子相交的完整流程 - 带模板参数的高效实现
+ * 
+ * 【核心功能】：
+ * 这是渲染管线中的关键函数，完成射线-粒子相交的完整处理：
+ * 1. 检测相交 (调用 hit 函数)
+ * 2. 计算贡献 (调用 integrateHit 函数)
+ * 3. 支持双向混合模式 (通过 let 模板参数优化)
+ * 
+ * 【let 模板参数的重要性】：
+ * <let backToFront : bool> 是编译时常量，允许编译器生成两个不同的优化版本：
+ * - backToFront=true:  从后往前的混合 (深度排序渲染)
+ * - backToFront=false: 从前往后的混合 (标准alpha混合)
+ * 
+ * 【渲染模式对比】：
+ * 前向后渲染: color = color * (1-alpha) + particle_color * alpha
+ * 后向前渲染: color = particle_color * alpha + color * (1-alpha)
+ * 数学等价但在数值精度和GPU优化上有差异
+ * 
+ * 【函数工作流程】：
+ * Step 1: 从缓冲区获取粒子参数 (fetchParameters)
+ * Step 2: 执行射线-椭球相交测试 (hit)
+ * Step 3: 如果相交，计算alpha混合贡献 (integrateHit)
+ * Step 4: 返回权重值用于后续处理
+ * 
+ * @param rayOrigin         射线起点 (世界坐标，不参与微分)
+ * @param rayDirection      射线方向 (世界坐标，不参与微分)
+ * @param particleIdx       粒子索引 (不参与微分)
+ * @param parametersBuffer  参数缓冲区 (不参与微分)
+ * @param transmittance     输入输出：射线透射率 (参与微分)
+ * @param integratedDepth   输入输出：积分深度 (参与微分)
+ * @param enableNormal      是否计算法线 (不参与微分)
+ * @param integratedNormal  输入输出：积分法线 (参与微分)
+ * @return 返回混合权重值，0.0表示无相交
+ */
 [BackwardDifferentiable][ForceInline]
 float processHitFromBuffer<let backToFront : bool>(
     no_diff float3 rayOrigin,
@@ -590,46 +631,114 @@ float processHitFromBuffer<let backToFront : bool>(
     no_diff bool enableNormal,
     inout float3 integratedNormal)
 {
-    float alpha = 0.0f;
-    float depth;
-    float3 normal;
-    if (hit(rayOrigin,
-            rayDirection,
-            fetchParameters(particleIdx, parametersBuffer),
-            alpha,
-            depth,
-            enableNormal,
-            normal))
+    // 初始化局部变量，用于接收相交测试结果
+    float alpha = 0.0f;    // 粒子不透明度 (输出)
+    float depth;           // 相交距离 (输出)  
+    float3 normal;         // 表面法线 (输出)
+    
+    // 🎯 核心步骤：执行射线-高斯椭球相交测试
+    // hit() 函数包含了完整的几何计算：
+    // 1. 坐标变换 (世界空间 → 粒子局部空间 → 标准化空间)
+    // 2. 距离计算 (canonicalRayMinSquaredDistance)
+    // 3. 核函数响应 (canonicalRayMaxKernelResponse)  
+    // 4. alpha值计算和阈值检查
+    if (hit(rayOrigin,                                          // 射线起点
+            rayDirection,                                       // 射线方向
+            fetchParameters(particleIdx, parametersBuffer),    // 从缓冲区获取粒子参数
+            alpha,                                             // [输出] 计算得到的不透明度
+            depth,                                             // [输出] 击中距离
+            enableNormal,                                      // 是否需要计算法线
+            normal))                                           // [输出] 表面法线
     {
-        return integrateHit<backToFront>(alpha, 
-                                         transmittance, 
-                                         depth, 
-                                         integratedDepth, 
-                                         enableNormal, 
-                                         normal, 
-                                         integratedNormal);
+        // ✅ 相交成功！调用混合函数处理贡献
+        // 🚀 这里使用了 let 模板参数 <backToFront>，编译器会生成优化的特化版本
+        return integrateHit<backToFront>(alpha,           // 当前粒子的不透明度
+                                         transmittance,   // [输入输出] 射线剩余透射率
+                                         depth,           // 击中距离，用于深度积分
+                                         integratedDepth, // [输入输出] 累积深度值
+                                         enableNormal,    // 是否处理法线
+                                         normal,          // 当前表面法线
+                                         integratedNormal); // [输入输出] 累积法线
     }
+    
+    // ❌ 无相交，返回零权重
     return 0.0f;
 }
 
+/**
+ * 计算高斯粒子的协方差矩阵 - 椭球几何的数学核心
+ * 
+ * 【数学原理】：
+ * 协方差矩阵 Σ 完全描述了高斯分布的形状和朝向：
+ * Σ = R * S * S^T * R^T
+ * 
+ * 其中：
+ * - R: 旋转矩阵 (3×3)，控制椭球的朝向
+ * - S: 对角缩放矩阵 diag(scale_x, scale_y, scale_z)，控制椭球各轴长
+ * 
+ * @param parameters 粒子参数，包含位置、缩放和旋转信息
+ * @return 3×3 协方差矩阵，描述高斯椭球的完整几何形状
+ */
 [BackwardDifferentiable][ForceInline] float3x3 computeCovariance(
     in Parameters parameters) {
-    // Σ = RSS^TR^T
-    const float3x3 StRt = float3x3(parameters.scale.x * parameters.rotationT[0],
-                                  parameters.scale.y * parameters.rotationT[1],
-                                  parameters.scale.z * parameters.rotationT[2]);
+    // 🧮 数学公式：Σ = R * S * S^T * R^T = (R*S) * (R*S)^T
+    // 步骤1: 计算 StRt = R * S (旋转矩阵右乘缩放)
+    // 这里利用了 parameters.rotationT 已经是转置，所以实际计算的是 S * R^T
+    const float3x3 StRt = float3x3(
+        parameters.scale.x * parameters.rotationT[0],  // 第一列：X轴缩放 * 旋转第一行
+        parameters.scale.y * parameters.rotationT[1],  // 第二列：Y轴缩放 * 旋转第二行  
+        parameters.scale.z * parameters.rotationT[2]   // 第三列：Z轴缩放 * 旋转第三行
+    );
+    
+    // 步骤2: 计算最终协方差矩阵 Σ = StRt^T * StRt
+    // transpose(StRt) 得到 (S*R^T)^T = R*S^T，然后右乘 StRt = S*R^T
+    // 结果：(R*S^T) * (S*R^T) = R * S^T * S * R^T = R * S * S^T * R^T = Σ
     return mul(transpose(StRt), StRt);
 }
 
+/**
+ * 计算从光源到粒子的入射方向向量 - 光照计算的基础
+ * 【数学计算】：
+ * 入射方向 = normalize(粒子位置 - 光源位置)
+ * @param parameters    粒子参数，包含位置信息
+ * @param sourcePosition 光源位置 (不参与微分，通常是相机位置)
+ * @return 归一化的入射方向向量 (从光源指向粒子)
+ */
 [BackwardDifferentiable] [ForceInline]
 float3 incidentDirectionFromParameters(
     Parameters parameters,
     no_diff float3 sourcePosition
 )
 {
+    // 🌟 计算从光源到粒子的方向向量并归一化
+    // 向量减法：粒子位置 - 光源位置 = 从光源指向粒子的向量
+    // normalize: 转换为单位向量，只保留方向信息
     return normalize(parameters.position - sourcePosition);
 }
 
+/**
+ * 从缓冲区计算入射方向 - incidentDirectionFromParameters 的缓冲区版本
+ * 
+ * 【功能】：
+ * 这是 incidentDirectionFromParameters 的便利包装函数，
+ * 自动从缓冲区获取粒子参数后计算入射方向。
+ * 
+ * 【使用场景】：
+ * 在渲染循环中，通常只有粒子索引而不是直接的参数对象，
+ * 这个函数避免了手动调用 fetchParameters 的步骤。
+ * 
+ * 【返回值特性】：
+ * 返回值标记为 no_diff，意味着这个方向向量本身不参与梯度计算，
+ * 但通过 fetchParameters 获取的粒子位置仍然可以接收梯度。
+ * 
+ * 【调用链】：
+ * incidentDirectionFromBuffer → fetchParameters → incidentDirectionFromParameters
+ * 
+ * @param particleIdx       粒子索引 (不参与微分)
+ * @param parametersBuffer  参数缓冲区 (不参与微分)  
+ * @param sourcePosition    光源位置 (不参与微分)
+ * @return 归一化的入射方向向量 (标记为不参与微分)
+ */
 [BackwardDifferentiable][ForceInline]
 no_diff float3 incidentDirectionFromBuffer(
     no_diff uint32_t particleIdx,
@@ -637,6 +746,9 @@ no_diff float3 incidentDirectionFromBuffer(
     no_diff float3 sourcePosition
 )
 {
+    // 🔄 两步式调用：先获取参数，再计算方向
+    // 1. fetchParameters: 从缓冲区获取粒子的完整参数
+    // 2. incidentDirectionFromParameters: 使用参数计算入射方向
     return incidentDirectionFromParameters(
         fetchParameters(particleIdx, parametersBuffer),
         sourcePosition
@@ -712,18 +824,35 @@ inline bool particleDensityHit(
     bool enableNormal,                         // 输入：是否需要法线
     out float3 normal)                         // 输出：表面法线
 {
-    // ========== 直接转发到核心实现 ==========
-    // 注意：这里的depth参数将返回精确的hitT值，用于K-Buffer排序
-    // 这个hitT与全局排序使用的globalDepth不同：
+    // ========== 完整渲染碰撞检测：直接转发到核心实现 ==========
+    //
+    // 【函数职责】：
+    // 这是渲染管线中最常用的碰撞检测接口，提供完整的相交信息：
+    // 1. ✅ Alpha值计算：用于透明度混合
+    // 2. ✅ 精确深度：用于深度缓冲和排序  
+    // 3. ✅ 表面法线：用于光照计算
+    // 4. ✅ 自动微分：支持梯度反向传播
+    //
+    // 【与其他hit函数的对比】：
+    // - 本函数：完整功能，适合最终渲染
+    // - HitCustom：只几何测试，适合预筛选
+    // - HitInstance：预变换优化，适合批量处理
+    //
+    // 【关键输出说明】：
+    // depth参数返回的是精确的hitT值，这对K-Buffer排序至关重要：
     // - globalDepth：粒子中心到相机的距离（用于粗排序）
     // - hitT (depth)：光线实际击中粒子表面的参数化距离（用于精排序）
+    //
+    // 【调用链路径】：
+    // C++ → [CudaDeviceExport] → gaussianParticle.hit() → 完整数学计算
+    //
     return gaussianParticle.hit(rayOrigin,      // 转发：光线起点
                                 rayDirection,    // 转发：光线方向
                                 parameters,      // 转发：粒子参数
-                                alpha,          // 转发：不透明度输出
-                                depth,          // 转发：hitT输出（核心！）
+                                alpha,          // 转发：不透明度输出 (关键渲染信息!)
+                                depth,          // 转发：hitT输出 (精确深度!)
                                 enableNormal,   // 转发：法线计算标志
-                                normal);        // 转发：法线输出
+                                normal);        // 转发：表面法线输出
 }
 
 /**
@@ -798,12 +927,64 @@ inline float particleDensityProcessHitFwdFromBuffer(
         integratedNormal);
 }
 
+/**
+ * 高斯粒子碰撞处理的反向传播函数 - 自动微分系统的核心
+ *
+ * 【核心功能】：
+ * 这是体积渲染中最重要的反向传播函数，负责计算所有参与渲染的参数梯度。
+ * 实现了复杂的链式法则计算，将输出梯度反向传播到粒子参数。
+ *
+ * 【数学原理 - 体积渲染的反向模式】：
+ * 前向积分公式：
+ *   transmittance_new = transmittance_old * (1 - alpha)
+ *   depth_new = depth_old + alpha * hit_depth
+ *   normal_new = normal_old + alpha * hit_normal
+ *
+ * 反向传播：使用链式法则恢复状态并计算梯度
+ *   weight = 1.0 / (1 - alpha)  // 反向权重
+ *   transmittance = transmittance_new * weight  // 恢复原始透射率
+ *   depth = (depth_new - alpha * hit_depth) * weight  // 恢复原始深度
+ *
+ * 【工作流程】：
+ * 1. 🔄 状态恢复：将前向积分的结果逆向恢复到积分前状态
+ * 2. 📦 梯度包装：将值和梯度包装为 DifferentialPair 对象
+ * 3. 🧠 自动微分：调用 bwd_diff() 引擎计算参数梯度
+ * 4. 📤 梯度提取：从 DifferentialPair 中提取计算得到的梯度
+ *
+ * 【关键技术 - DifferentialPair】：
+ * Slang的双数（Dual Number）实现，每个值都携带其梯度：
+ *   DifferentialPair<T> = { value: T, differential: T }
+ * 支持自动跟踪整个计算图的梯度流。
+ *
+ * 【应用场景】：
+ * - 🎓 神经辐射场训练：优化高斯粒子的位置、旋转、缩放
+ * - 🎨 可微渲染：实现基于梯度的场景重建
+ * - 🔧 参数优化：端到端训练整个渲染管线
+ *
+ * @param rayOrigin             射线起点 (世界坐标，不参与微分)
+ * @param rayDirection          射线方向 (世界坐标，不参与微分)  
+ * @param particleIdx           粒子索引 (不参与微分)
+ * @param commonParameters      公共参数缓冲区 (不参与微分)
+ * @param alpha                 前向：粒子不透明度值 (输入)
+ * @param alphaGrad             反向：不透明度梯度 (输入)
+ * @param transmittance         前向：透射率 | 反向：恢复后的透射率 (输入输出)
+ * @param transmittanceGrad     反向：透射率梯度 (输入输出)
+ * @param depth                 前向：击中深度 (输入)
+ * @param integratedDepth       前向：积分深度 | 反向：恢复后的积分深度 (输入输出)
+ * @param integratedDepthGrad   反向：积分深度梯度 (输入输出)
+ * @param enableNormal          是否处理法线 (不参与微分)
+ * @param normal                前向：表面法线 (输入)
+ * @param integratedNormal      前向：积分法线 | 反向：恢复后的积分法线 (输入输出)
+ * @param integratedNormalGrad  反向：积分法线梯度 (输入输出)
+ */
 [CudaDeviceExport]
 void particleDensityProcessHitBwdToBuffer(
+    // 射线信息（输入，不参与梯度）
     float3 rayOrigin,
     float3 rayDirection,
     uint32_t particleIdx,
     gaussianParticle.CommonParameters commonParameters,
+    // 前向传播的值和对应梯度
     in float alpha,
     in float alphaGrad,
     inout float transmittance,
@@ -818,11 +999,17 @@ void particleDensityProcessHitBwdToBuffer(
 {
     if (alpha > 0.0f)
     {
+        // 步骤1:恢复前向状态
         const float weight = 1.0f / (1.0f - alpha);
-        
+
         transmittance *= weight;
+        // 这是Slang的双数（Dual Number）实现：
+        // 值部分：前向计算结果
+        // 微分部分：反向传播梯度
+        // 自动跟踪：计算过程中的梯度传播
         DifferentialPair<float> transmittanceDiff = DifferentialPair<float>(transmittance, transmittanceGrad);
         
+        // 步骤2:恢复积分深度
         integratedDepth = (integratedDepth - depth * alpha) * weight;
         DifferentialPair<float> integratedDepthDiff = DifferentialPair<float>(integratedDepth, integratedDepthGrad);
 
@@ -837,6 +1024,7 @@ void particleDensityProcessHitBwdToBuffer(
             integratedNormalDiff = DifferentialPair<float3>(float3(0), float3(0));
         }
 
+        // 步骤3:调用自动微分引擎
         bwd_diff(gaussianParticle.processHitFromBuffer<true>)(
             rayOrigin,
             rayDirection,
@@ -857,6 +1045,51 @@ void particleDensityProcessHitBwdToBuffer(
     }
 }
 
+/**
+ * 自定义高斯粒子碰撞检测 - K-Buffer渲染器的专用函数
+ *
+ * 【核心功能】：
+ * 这是为K-Buffer深度排序渲染优化的碰撞检测函数，专门用于快速确定
+ * 射线是否与高斯粒子相交，并计算精确的击中距离用于深度排序。
+ *
+ * 【与标准hit函数的区别】：
+ * - 标准hit：计算alpha值，用于颜色混合
+ * - 本函数：只计算几何相交，用于深度排序
+ * - 性能优化：跳过复杂的核函数计算，只做几何测试
+ *
+ * 【工作流程】：
+ * 1. 🔍 参数获取：从缓冲区获取指定粒子的几何参数
+ * 2. 🎯 坐标变换：将世界空间射线转换到粒子标准化空间
+ * 3. 📊 核响应计算：计算最大可能的核函数响应值
+ * 4. 📏 距离计算：计算射线到粒子中心投影的参数化距离
+ * 5. ✅ 多重检测：执行距离范围和几何相交的联合测试
+ *
+ * 【数学原理】：
+ * 击中距离 = canonicalRayDistance() 计算的是射线参数t值：
+ *   hit_point = rayOrigin + t * rayDirection
+ * 其中t就是hitDistance，代表沿射线方向的参数化距离。
+ *
+ * 【K-Buffer应用】：
+ * K-Buffer需要对每个像素维护K个最近的碰撞点：
+ * 1. 快速筛选：使用本函数确定相交性
+ * 2. 距离排序：使用hitDistance进行深度排序  
+ * 3. 精确渲染：只对排序后的前K个粒子进行完整渲染
+ *
+ * 【性能优化策略】：
+ * - 🚀 几何裁剪：通过距离范围快速剔除不相关粒子
+ * - 🎯 精确测试：使用canonicalRayMinSquaredDistance做最终验证
+ * - 📈 批量处理：支持并行处理大量射线-粒子对
+ *
+ * @param rayOrigin                    射线起点 (世界坐标)
+ * @param rayDirection                 射线方向 (世界坐标，单位向量)
+ * @param particleIdx                  目标粒子索引
+ * @param commonParameters             公共参数缓冲区
+ * @param minHitDistance              最小有效击中距离 (近裁剪面)
+ * @param maxHitDistance              最大有效击中距离 (远裁剪面)
+ * @param maxParticleSquaredDistance  最大粒子平方距离阈值 (几何相交判断)
+ * @param hitDistance                 输出：参数化击中距离 (射线参数t值)
+ * @return 是否发生有效相交 (通过所有几何和距离测试)
+ */
 [CudaDeviceExport]
 bool particleDensityHitCustom(
     float3 rayOrigin,
@@ -869,30 +1102,105 @@ bool particleDensityHitCustom(
     out float hitDistance
 )
 {
+    // ========== K-Buffer优化：几何碰撞检测管线 ==========
+    //
+    // 【设计思想】：
+    // 本函数专为K-Buffer深度排序优化，只关心几何相交而非渲染细节。
+    // 跳过昂贵的alpha和法线计算，专注于快速的距离测试。
+    //
+    
+    // 步骤1: 🔍 参数获取 - 从GPU缓冲区读取粒子几何参数
     gaussianParticle.Parameters parameters = gaussianParticle.fetchParameters(particleIdx, commonParameters.parametersBuffer);
 
-    float3 canonicalRayOrigin;
-    float3 canonicalRayDirection;
+    // 步骤2: 🎯 坐标空间变换 - 将世界空间转换为粒子标准化空间
+    // 这是高斯相交的核心：将椭球标准化为单位球，简化后续计算
+    float3 canonicalRayOrigin;      // 变换后的射线起点
+    float3 canonicalRayDirection;   // 变换后的射线方向
     gaussianParticle.cannonicalRay(
-        rayOrigin,
-        rayDirection,
-        parameters,
-        canonicalRayOrigin,
-        canonicalRayDirection);
+        rayOrigin,                  // 输入：世界空间射线起点
+        rayDirection,               // 输入：世界空间射线方向
+        parameters,                 // 输入：粒子变换参数(位置、旋转、缩放)
+        canonicalRayOrigin,         // 输出：标准化空间射线起点
+        canonicalRayDirection);     // 输出：标准化空间射线方向
 
+    // 步骤3: 📊 核函数响应计算 - 计算射线在高斯核函数中的最大响应值
+    // 注意：这里计算了maxResponse但实际上在后续判断中并未使用
+    // 可能是为了保持与完整hit函数的接口一致性或未来扩展预留
     const float maxResponse = gaussianParticle.canonicalRayMaxKernelResponse<gaussianParticle.KernelDegree>(
-        canonicalRayOrigin,
-        canonicalRayDirection);
+        canonicalRayOrigin,         // 标准化射线起点
+        canonicalRayDirection);     // 标准化射线方向
 
-    // distance to the gaussian center projection on the ray
+    // 步骤4: 📏 几何距离计算 - 计算射线参数t值 (关键!)
+    // 这是K-Buffer排序的核心数据：射线到高斯中心投影的参数化距离
     hitDistance = gaussianParticle.canonicalRayDistance(canonicalRayOrigin, canonicalRayDirection, parameters.scale);
 
-    return (hitDistance > minHitDistance) &&
-           (hitDistance < maxHitDistance) &&
-           (gaussianParticle.canonicalRayMinSquaredDistance(
+    // 步骤5: ✅ 三重验证 - 联合几何测试确保有效相交
+    // 三个条件必须同时满足才算有效击中：
+    return (hitDistance > minHitDistance) &&           // 条件1: 距离范围检查 (近裁剪面)
+           (hitDistance < maxHitDistance) &&           // 条件2: 距离范围检查 (远裁剪面)  
+           (gaussianParticle.canonicalRayMinSquaredDistance(   // 条件3: 几何相交验证
                 canonicalRayOrigin, canonicalRayDirection) < maxParticleSquaredDistance);
+    //
+    // 【最终判断逻辑】：
+    // 只有当射线在有效距离范围内，且确实与高斯椭球几何相交时，
+    // 才返回true并输出有效的hitDistance供K-Buffer排序使用。
 }
 
+/**
+ * 实例化高斯粒子碰撞检测 - 预变换射线的超高速检测
+ *
+ * 【核心功能】：
+ * 这是最高性能的碰撞检测函数，专门处理已经过坐标变换的射线。
+ * 跳过复杂的坐标变换步骤，直接在标准化空间中进行几何计算。
+ *
+ * 【与其他hit函数的性能对比】：
+ * - particleDensityHit：完整计算，包含alpha值 (最慢，最完整)
+ * - particleDensityHitCustom：几何检测，包含坐标变换 (中等速度)
+ * - 【本函数】：预变换射线，纯几何计算 (最快，适合批量处理)
+ *
+ * 【预处理优势】：
+ * 输入的射线已经过 canonicalRay() 变换，意味着：
+ * 1. 🎯 椭球 → 单位球：高斯椭球已标准化为单位球
+ * 2. 🔧 坐标归一化：所有计算都在标准化空间进行
+ * 3. ⚡ 跳过变换：省去耗时的矩阵变换步骤
+ *
+ * 【数学原理 - 射线到原点最近点】：
+ * 在标准化空间中，计算射线到原点(椭球中心)的最近距离参数：
+ *
+ * 射线方程：P(t) = origin + t * direction
+ * 目标：最小化 |P(t)|² = |origin + t * direction|²
+ *
+ * 求导并令其为0：
+ * d/dt[|origin + t * direction|²] = 0
+ * 2(origin + t * direction) · direction = 0
+ * 2(origin · direction + t * |direction|²) = 0
+ * t = -(origin · direction) / |direction|²
+ *
+ * 【实现细节】：
+ * numerator = -dot(canonicalRayOrigin, canonicalUnormalizedRayDirection)
+ * denominator = rcp(dot(canonicalUnormalizedRayDirection, canonicalUnormalizedRayDirection))
+ * hitDistance = numerator * denominator
+ *
+ * 【应用场景】：
+ * - 🚀 实例化渲染：大量相同几何的高效处理
+ * - 📊 批量测试：预先变换射线，然后并行测试多个粒子
+ * - 🎮 实时渲染：性能要求极高的交互式应用
+ * - 🔄 LOD系统：远距离粒子的快速裁剪
+ *
+ * 【性能特点】：
+ * - ✅ 无矩阵运算：跳过坐标变换
+ * - ✅ 纯向量操作：GPU向量单元友好
+ * - ✅ 分支最少：减少GPU线程分化
+ * - ✅ 内存高效：复用预计算结果
+ *
+ * @param canonicalRayOrigin              标准化空间中的射线起点
+ * @param canonicalUnormalizedRayDirection 标准化空间中的射线方向 (未归一化)
+ * @param minHitDistance                  最小有效击中距离
+ * @param maxHitDistance                  最大有效击中距离
+ * @param maxParticleSquaredDistance      最大粒子平方距离阈值
+ * @param hitDistance                     输出：击中距离参数t值
+ * @return 是否通过所有距离和几何测试
+ */
 [CudaDeviceExport]
 bool particleDensityHitInstance(
     float3 canonicalRayOrigin,
@@ -903,14 +1211,52 @@ bool particleDensityHitInstance(
     out float hitDistance
 )
 {
+    // ========== 超高速实例化检测：纯数学几何计算 ==========
+    //
+    // 【设计哲学】：
+    // 这是最精简的碰撞检测实现，专为海量并行处理优化。
+    // 所有复杂的坐标变换都已预先完成，这里只做纯数学计算。
+    //
+    
+    // 步骤1: 🧮 射线到原点最近点的参数t计算
+    // 数学推导：最小化 |canonicalRayOrigin + t * canonicalUnormalizedRayDirection|²
+    // 对t求导并令其为0: d/dt[...] = 0 
+    // 解得: t = -(origin · direction) / |direction|²
+    //
     const float numerator = -dot(canonicalRayOrigin, canonicalUnormalizedRayDirection);
+    //    ^^^^^^^^^^^^^
+    //    分子: -(射线起点 · 射线方向) 
+    //    物理意义：起点向量在方向向量上的投影(取负号)
+    
     const float denominator = rcp(dot(canonicalUnormalizedRayDirection, canonicalUnormalizedRayDirection));
+    //    ^^^^^^^^^^^^^^^^^^^^^
+    //    分母倒数: 1 / |射线方向|²
+    //    rcp()是GPU优化的倒数函数，比 (1.0/x) 更快
+    
     hitDistance = numerator * denominator;
-    return (hitDistance > minHitDistance) &&
-           (hitDistance < maxHitDistance) &&
-           (gaussianParticle.canonicalRayMinSquaredDistance(
-                canonicalRayOrigin,
-                normalize(canonicalUnormalizedRayDirection)) < maxParticleSquaredDistance);
+    //    ^^^^^^^^^^^^
+    //    最终结果：射线参数t，表示最近点位置
+    //    几何意义：origin + t * direction = 离原点最近的射线上的点
+
+    // 步骤2: ✅ 三重安全验证
+    // 确保计算出的击中距离满足所有约束条件
+    return (hitDistance > minHitDistance) &&              // 验证1: 近裁剪面检查
+           (hitDistance < maxHitDistance) &&              // 验证2: 远裁剪面检查
+           (gaussianParticle.canonicalRayMinSquaredDistance(    // 验证3: 几何相交检查
+                canonicalRayOrigin,                       //   使用标准化射线起点
+                normalize(canonicalUnormalizedRayDirection)    //   归一化射线方向
+           ) < maxParticleSquaredDistance);
+    //
+    // 【性能要点】：
+    // 1. 🚀 无矩阵运算：避免了昂贵的坐标变换
+    // 2. 🎯 向量计算：充分利用GPU SIMD指令
+    // 3. 📐 数学优化：使用rcp()等GPU特化函数
+    // 4. 🔧 最小分支：减少GPU线程发散
+    //
+    // 【使用场景】：
+    // - 实例化渲染：相同几何的大规模复制
+    // - LOD优化：远距离粒子的快速剔除
+    // - 预筛选：在完整渲染前的粗筛选阶段
 }
 
 /**

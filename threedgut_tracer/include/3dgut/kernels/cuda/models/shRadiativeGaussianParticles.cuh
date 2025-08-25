@@ -151,6 +151,27 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     __forceinline__ __device__ void initializeDensity(threedgut::MemoryHandles parameters) {
         // 🔒 编译时类型安全检查：确保C++与Slang数据结构完全匹配
         // 这些断言防止因类型大小不匹配导致的内存访问错误
+        //
+        // 📝 重要说明：gaussianParticle_RawParameters_0 类型来源
+        // ============================================================
+        // 这个类型并非在C++源码中直接定义，而是由Slang编译器自动生成：
+        //
+        // 1. 🎯 生成过程：
+        //    - setup_3dgut.py 调用 slangc 编译器
+        //    - 编译 include/3dgut/kernels/slang/models/gaussianParticles.slang
+        //    - 自动生成 threedgutSlang.cuh 头文件
+        //
+        // 2. 🔄 类型映射：
+        //    Slang源码:     struct RawParameters { ... }  
+        //    生成的C++:    struct gaussianParticle_RawParameters_0 { ... }
+        //    C++包装:      using DensityRawParameters = threedgut::ParticleDensity;
+        //
+        // 3. 🛡️ 作用：确保跨语言（C++ ↔ Slang）的内存布局兼容性
+        //    - 防止结构体大小不匹配导致的内存访问错误
+        //    - 保证GPU内存中的数据可以在两种语言间安全传递
+        //
+        // 4. 📁 生成文件位置：通常在构建目录中的 threedgutSlang.cuh
+        //
         static_assert(sizeof(DensityRawParameters) == sizeof(gaussianParticle_RawParameters_0), 
                      "Sizes must match for binary compatibility");
         static_assert(sizeof(DensityParameters) == sizeof(gaussianParticle_Parameters_0), 
@@ -216,6 +237,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
      */
     __forceinline__ __device__ DensityParameters fetchDensityParameters(uint32_t particleIdx) const {
         // 🔄 调用Slang导出函数进行参数优化转换
+        // 这里调用了particleDensityParameters (Slang导出函数)
         const auto parameters = particleDensityParameters(
             particleIdx,
             {reinterpret_cast<gaussianParticle_RawParameters_0*>(m_densityRawParameters.ptr), nullptr});

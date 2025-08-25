@@ -144,13 +144,24 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 tangential_coeffs=np.zeros((2,), dtype=np.float32),
                 thin_prism_coeffs=np.zeros((4,), dtype=np.float32),
             )
+            # 🎯 射线预计算流程的核心调用
+            # 这里生成了每个像素不同的射线方向 - 这是透视投影的本质！
+            # 
+            # 详细过程：
+            # 1. pinhole_camera_rays() 使用透视投影逆变换
+            # 2. 将2D像素坐标 (u,v) 转换为3D射线方向
+            # 3. 每个像素都得到唯一的射线方向，创造透视效果
+            # 
+            # 返回结果：
+            # - rays_o_cam: 相机空间射线起点 [H,W,3] (都是原点)
+            # - rays_d_cam: 相机空间射线方向 [H,W,3] (每个像素不同!)
             rays_o_cam, rays_d_cam = pinhole_camera_rays(
                 u, v, focalx, focaly, w, h, self.ray_jitter
             )
             return (
                 params.to_dict(),
-                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(out_shape),
-                torch.tensor(rays_d_cam, dtype=torch.float32).reshape(out_shape),
+                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(out_shape),  # 射线起点张量
+                torch.tensor(rays_d_cam, dtype=torch.float32).reshape(out_shape),  # 射线方向张量
                 type(params).__name__,
             )
 

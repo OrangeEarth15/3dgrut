@@ -1,0 +1,50 @@
+CompileFlags:
+  Add:
+    # PyTorch headers
+    - -I/home/scratch.sarawang_ent/sarawang/miniconda3/envs/3dgrut_cuda12/lib/python3.11/site-packages/torch/include
+    - -I/home/scratch.sarawang_ent/sarawang/miniconda3/envs/3dgrut_cuda12/lib/python3.11/site-packages/torch/include/torch/csrc/api/include
+    # CUDA headers
+    - -I/home/scratch.sarawang_ent/sarawang/miniconda3/envs/3dgrut_cuda12/include
+    # C++ standard
+    - -std=c++17
+    # Suppress some common warnings for better experience
+    - -Wno-unused-parameter
+    - -Wno-unused-variable
+    - -Wno-sign-compare
+  Remove:
+    # Remove problematic flags
+    - -forward-unknown-to-host-compiler
+    - --expt-relaxed-constexpr
+    - --expt-extended-lambda
+
+Diagnostics:
+  # Suppress some CUDA-specific warnings that clangd doesn't understand well
+  Suppress:
+    - unused-parameter
+    - unused-variable
+    - macro-redefined
+  ClangTidy:
+    Add:
+      - readability-*
+      - modernize-*
+      - performance-*
+    Remove:
+      - modernize-use-trailing-return-type
+      - readability-braces-around-statements
+
+# 改善模板和实例化的跳转体验
+Completion:
+  AllScopesCompletion: true
+  
+# 更好的索引支持
+Index:
+  StandardLibrary: true
+  Background: Build
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true
+
+Hover:
+  ShowAKA: true

@@ -19,7 +19,7 @@ namespace gaussianParticle
     static const float MinParticleKernelDensity = GAUSSIAN_PARTICLE_MIN_KERNEL_DENSITY;
     static const float MaxParticleAlpha = GAUSSIAN_PARTICLE_MAX_ALPHA;
     static const float MinParticleAlpha = GAUSSIAN_PARTICLE_MIN_ALPHA;
-    static const bool EnableNormal = false;
+    static const bool EnableNormal = false; // 不允许法线相关逻辑
     static const bool Surfel = false; // 表面元素模式，默认关闭，如果开启，粒子视为表面片
 };
 

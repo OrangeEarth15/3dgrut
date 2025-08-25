@@ -167,8 +167,8 @@ class Tracer:
             tracer_wrapper, # 底层C++/CUDA渲染器包装器
             frame_id, # 当前渲染帧ID
             n_active_features, # 颜色特征数目
-            ray_ori, 
-            ray_dir,
+            ray_ori,  # 🎯 预计算的射线起点 [H,W,3] - 来自数据集的pinhole_camera_rays
+            ray_dir,  # 🎯 预计算的射线方向 [H,W,3] - 每个像素都不同!
             mog_pos,
             mog_rot,
             mog_scl, # mixure of gaussians scale
@@ -189,14 +189,28 @@ class Tracer:
                 * sensor_poses.timestamps_us[0]
             ) # 创建光线时间戳：为每条光线分配相同的时间戳
 
+            # 🚀 将预计算的射线传递给底层渲染器
+            # 
+            # 【关键理解】：
+            # ray_ori 和 ray_dir 包含了每个像素的不同射线方向！
+            # 这些射线是在数据集加载时通过 pinhole_camera_rays() 预计算的。
+            # 
+            # 【数据流向】：
+            # 数据集 → pinhole_camera_rays() → camera_to_world_rays() → 这里 → GPU渲染器
+            # 
+            # 【GPU内部处理】：
+            # 每个CUDA线程会从 ray_dir[pixel_idx] 获取该像素的特定射线方向
+            # 然后调用 canonicalRayMinSquaredDistance(ray_origin, ray_direction)
+            # 其中 ray_direction 对每个像素都不同，这就是透视投影的本质！
+            # 
             # [二维投影信息，命中距离，命中次数，可见性]
             ray_radiance_density, ray_hit_distance, ray_hit_count, mog_visibility = tracer_wrapper.trace(
                 frame_id,
                 n_active_features,
                 particle_density,
                 particle_radiance,
-                ray_ori.contiguous(),
-                ray_dir.contiguous(),
+                ray_ori.contiguous(),   # 传递预计算的射线起点张量
+                ray_dir.contiguous(),   # 传递预计算的射线方向张量 (每个像素不同!)
                 ray_time.contiguous(),
                 sensor_params,
                 sensor_poses.timestamps_us[0],
