@@ -524,26 +524,64 @@ bool hit(
     return acceptHit;
 }
 
+// ========== integrateHit调用链 - 第4层：核心实现算法 ==========
+//
+// 🗺️ 【调用链终点】：
+// 1. K-Buffer (gutKBufferRenderer.cuh:244) → particles.densityIntegrateHit()
+// 2. C++包装 (shRadiativeGaussianParticles.cuh:344) → particleDensityIntegrateHit()
+// 3. Slang导出 (gaussianParticles.slang:873) → gaussianParticle.integrateHit<false>()
+// 4. 【当前层】核心实现 (gaussianParticles.slang:551) → 实际Alpha混合计算
+//
+// 【本层作用】：体积渲染核心算法 - Alpha混合的数学实现
+// - 这是整个调用链的最底层，包含真正的数学计算逻辑
+// - 实现标准的Alpha混合公式和透射率更新
+// - 支持双向渲染模式：前向后（K-Buffer使用）和后向前
+// - 通过模板参数<backToFront>在编译时生成不同的优化版本
+//
+// 🎨 【数学原理】：
+// Alpha混合公式（Porter-Duff理论）：
+// C_out = α × C_src + (1-α) × C_dst  // 标准Alpha混合
+// T_out = T_in × (1-α)                    // 透射率更新
+// weight = α × T_in                        // 实际贡献权重
+//
+// 【渲染模式对比】：
+// 前向后模式 (backToFront=false)：
+//   weight = alpha * transmittance           // 正确的物理权重
+//   integratedDepth += depth * weight        // 累积平均深度
+//   transmittance *= (1 - alpha)             // 透射率衰减
+// 后向前模式 (backToFront=true)：
+//   weight = alpha                           // 直接使用alpha值
+//   integratedDepth = lerp(old, new, alpha)  // 线性插值混合
+//   transmittance *= (1 - alpha)             // 同样的透射率更新
+//
+// 📊 【性能优化】：
+// - [BackwardDifferentiable] 支持自动微分，用于神经网络训练
+// - [ForceInline] 强制内联展开，减少函数调用开销
+// - 模板特化 <let backToFront : bool> 编译时分支消除
+// - no_diff 标记不参与梯度计算的参数，优化内存使用
+//
 /**
- * 积分单次相交结果（体积渲染混合）
+ * 积分单次相交结果（体积渲染混合）- 核心实现算法
  *
- * 实现体积渲染中单个粒子的贡献积分。支持两种混合模式：
- * 1. 前向后模式：用于正向穿越，直接累加权重值
- * 2. 后向前模式：用于Over混合，使用线性插值
+ * 【核心功能】：
+ * 这是3DGUT渲染系统中最关键的数学实现，实现体积渲染中单个粒子的贡献积分。
+ * 支持两种混合模式，通过模板参数在编译时优化：
+ * 1. 前向后模式：用于正向穿越，直接累加权重值 (K-Buffer使用)
+ * 2. 后向前模式：用于Over混合，使用线性插值 (Alpha混合)
  *
  * 这个函数处理：
  * - 深度积分（用于Z-buffer或距离估计）
  * - 法线积分（用于光照计算）
  * - 透射率更新（控制后续粒子的影响）
  *
- * @param alpha 当前粒子的不透明度
- * @param transmittance 输入输出：累积透射率
- * @param depth 当前粒子的深度
- * @param integratedDepth 输入输出：累积深度
- * @param enableNormal 是否需要处理法线
- * @param normal 当前粒子的法线
- * @param integratedNormal 输入输出：累积法线
- * @return 当前粒子的混合权重
+ * @param alpha 当前粒子的不透明度 [0.0, 1.0]
+ * @param transmittance 输入输出：累积透射率 [0.0, 1.0]
+ * @param depth 当前粒子的深度（击中距离）
+ * @param integratedDepth 输入输出：累积深度（Z-buffer）
+ * @param enableNormal 是否需要处理法线计算
+ * @param normal 当前粒子的表面法线向量
+ * @param integratedNormal 输入输出：累积法线向量
+ * @return 当前粒子的混合权重（用于后续颜色混合）
  */
 // Slang	<let T : type>	func<let N : int>()
 // C++ template <> template <int N> func()
@@ -557,12 +595,17 @@ float integrateHit<let backToFront : bool>(
     in float3 normal,
     inout float3 integratedNormal)
 {
-   // 计算混合权重：根据混合模式选择不同的权重计算方式
+   // ========== 步骤1：混合权重计算 ==========
+   // 关键：根据渲染模式选择不同的权重计算方式
+   // - K-Buffer使用前向后模式：weight = alpha * transmittance （物理正确）
+   // - 后向前模式直接使用alpha值：weight = alpha
    const float weight = backToFront ? alpha : alpha * transmittance;
    
+   // ========== 步骤2：深度和法线积分 ==========
    if (backToFront)
    {
        // 后向前模式：Over混合，使用线性插值
+       // 公式：result = lerp(old, new, alpha) = old * (1-alpha) + new * alpha
        integratedDepth = lerp(integratedDepth, depth, alpha);
        if (enableNormal)
        {
@@ -572,6 +615,7 @@ float integrateHit<let backToFront : bool>(
    else 
    {
        // 前向后模式：正向穿越，直接累加权重值
+       // 公式：result += value * weight (加权平均)
        integratedDepth += depth * weight;
        if (enableNormal) 
        {
@@ -579,10 +623,15 @@ float integrateHit<let backToFront : bool>(
        }
    }
 
-   // 更新透射率：每个粒子都会减少后续光线的透射率
+   // ========== 步骤3：透射率更新 ==========
+   // 关键：每个粒子都会减少后续光线的透射率
+   // 公式：T_new = T_old * (1 - alpha) (指数衰减模型)
+   // 物理意义：光线被粒子部分吸收/散射，剩余能量减少
    transmittance *= (1 - alpha);
    
-   return weight;  // 返回当前粒子的实际混合权重
+   // ========== 步骤4：返回权重用于颜色混合 ==========
+   // 返回的权重将由featureIntegrateFwd使用，实现颜色的Alpha混合
+   return weight;  // 当前粒子的实际混合权重
 }
 
 /**
@@ -855,20 +904,49 @@ inline bool particleDensityHit(
                                 normal);        // 转发：表面法线输出
 }
 
+// ========== particleDensityIntegrateHit调用链 - 第3层：Slang导出接口 ==========
+//
+// 🔗 【调用链位置】：
+// 1. K-Buffer (gutKBufferRenderer.cuh:244) → particles.densityIntegrateHit()
+// 2. C++包装 (shRadiativeGaussianParticles.cuh:344) → particleDensityIntegrateHit()
+// 3. 【当前层】Slang导出 (gaussianParticles.slang:873) → gaussianParticle.integrateHit<false>()
+// 4. 核心实现 (gaussianParticles.slang:551) → 实际Alpha混合计算
+//
+// 【本层作用】：跨语言边界的稳定导出接口
+// - [CudaDeviceExport] 使得Slang函数可以被CUDA C++代码调用
+// - 提供稳定的ABI边界，隔离Slang内部实现细节
+// - 纯转发函数，不进行任何计算，只做语言边界的桥梁
+// - 确保参数类型兼容性和调用约定正确性
+//
+// 【渲染模式】：
+// - 使用前向后遍历模式 (backToFront=false)
+// - 适用于正向穿越的渲染算法 (front-to-back ray marching)
+// - 直接累积模式：integratedDepth += depth * weight
+//
+// 📊 【核心公式】（将在第4层实现）：
+// const float weight = alpha * transmittance;  // 权重计算
+// integratedDepth += depth * weight;           // 深度累积
+// transmittance *= (1 - alpha);               // 透射率更新
+// return weight;                               // 返回权重用于颜色混合
+//
 /**
- * 粒子密度相交积分（前向模式）
+ * 粒子密度相交积分（前向模式）- Slang导出接口
  * 
- * 对单个粒子的相交结果进行前向积分，用于体积渲染。
- * 使用前向后遍历模式，适用于正向穿越的渲染算法。
+ * 功能：为CUDA C++代码提供调用Slang实现的densityIntegrateHit功能的接口
+ * 作用：这是一个纯转发函数，将调用直接传递给内部的gaussianParticle.integrateHit()
  * 
- * @param alpha 粒子的不透明度
- * @param transmittance 输入输出：累积透射率
- * @param depth 粒子深度
- * @param integratedDepth 输入输出：累积深度
- * @param enableNormal 是否处理法线
- * @param normal 粒子法线
- * @param integratedNormal 输入输出：累积法线
- * @return 粒子的混合权重
+ * 重要：本函数不做任何计算，只是语言边界的桥梁
+ * - CUDA C++ → [CudaDeviceExport] → Slang内部实现
+ * - 确保参数类型兼容性和调用约定正确性
+ * 
+ * @param alpha 粒子的不透明度 [0.0, 1.0]
+ * @param transmittance 输入输出：累积透射率（会被修改）
+ * @param depth 粒子深度（击中距离）
+ * @param integratedDepth 输入输出：累积深度（会被修改）
+ * @param enableNormal 是否需要处理法线计算
+ * @param normal 粒子表面法线向量
+ * @param integratedNormal 输入输出：累积法线向量（会被修改）
+ * @return 粒子的混合权重（alpha * transmittance）
  */
 [CudaDeviceExport] inline float particleDensityIntegrateHit(
     in float alpha,
@@ -879,14 +957,18 @@ inline bool particleDensityHit(
     in float3 normal,
     inout float3 integratedNormal) 
 {
+    // ========== 直接转发到核心实现层 ==========
+    // 功能：将所有参数原封不动地传递给真正的算法实现
+    // 模板参数：<false> 表示使用前向后渲染模式
+    // 返回值：直接返回核心算法计算的权重值
     return gaussianParticle.integrateHit<false>(
-        alpha,
-        transmittance,
-        depth,
-        integratedDepth,
-        enableNormal,
-        normal,
-        integratedNormal);
+        alpha,              // 粒子不透明度
+        transmittance,      // 当前透射率（输入输出）
+        depth,              // 粒子深度
+        integratedDepth,    // 积分深度（输入输出）
+        enableNormal,       // 法线计算标志
+        normal,             // 当前法线
+        integratedNormal);  // 积分法线（输入输出）
 }
 
 /**

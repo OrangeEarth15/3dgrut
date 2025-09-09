@@ -189,13 +189,13 @@ struct GUTKBufferRenderer : Params {
         DensityRawParameters densityParameters;
     };
 
-    template <typename TRayPayload> // 处理单个击中粒子，计算颜色和透明度
+    template <typename TRayPayload> // 处理单个击中粒子，计算颜色和透明度混合
     static inline __device__ void processHitParticle(
-        TRayPayload& ray, // 光线载荷（前向或后向）
-        const HitParticle& hitParticle, // 击中粒子信息
-        const Particles& particles, // 粒子系统接口
-        const TFeaturesVec* __restrict__ particleFeatures, // 预计算特征数组
-        TFeaturesVec* __restrict__ particleFeaturesGradient) { // 特征梯度数组
+        TRayPayload& ray,                                     // 输入输出：光线数据载荷，包含累积特征、透射率等（会被修改）
+        const HitParticle& hitParticle,                      // 输入：击中粒子信息，包含索引、不透明度、击中距离等（只读）
+        const Particles& particles,                          // 输入：粒子系统接口，提供特征和密度计算方法（只读）
+        const TFeaturesVec* __restrict__ particleFeatures,   // 输入：预计算特征数组指针（静态模式下的粒子颜色/RGB，只读）
+        TFeaturesVec* __restrict__ particleFeaturesGradient) { // 输出：特征梯度数组指针（训练模式下累积梯度，可写）
         // 处理K-Buffer中单个击中粒子对光线的影响，支持前向渲染和反向梯度计算
         // 反向传播模式：计算梯度，用于神经网络训练
         // 前向渲染模式：计算最终颜色，用于图像生成
@@ -240,17 +240,46 @@ struct GUTKBufferRenderer : Params {
             ray.transmittance *= (1.0 - hitParticle.alpha);
 
         } else {
-            // 这计算当前粒子对最终像素的贡献权重
+            // ========== densityIntegrateHit调用链 - 第1层：K-Buffer渲染器 ==========
+            //
+            // 📍 【调用链结构】Alpha混合的权重计算核心
+            // 1. 【当前层】K-Buffer (gutKBufferRenderer.cuh:244) → particles.densityIntegrateHit()
+            // 2. C++包装层 (shRadiativeGaussianParticles.cuh:344) → particleDensityIntegrateHit()
+            // 3. Slang导出层 (gaussianParticles.slang:873) → gaussianParticle.integrateHit<false>()
+            // 4. 核心实现层 (gaussianParticles.slang:557) → 实际Alpha混合计算
+            //
+            // 【本层作用】：渲染管线中的权重计算请求
+            // - 为当前击中粒子计算对最终像素的贡献权重
+            // - 执行标准的Alpha混合公式：weight = alpha * transmittance  
+            // - 同时更新深度和透射率，维持渲染状态的一致性
+            // - 返回权重值供后续颜色混合使用
+            //
             const float hitWeight =
-                particles.densityIntegrateHit(hitParticle.alpha, // 粒子不透明度
-                                              ray.transmittance, // 当前光线透射率
-                                              hitParticle.hitT, // 击中距离
-                                              ray.hitT); // 光线总行进距离
+                particles.densityIntegrateHit(hitParticle.alpha,    // 输入：粒子不透明度[0,1]，控制遮挡强度
+                                              ray.transmittance,    // 输入输出：当前光线透射率，会被递减
+                                              hitParticle.hitT,     // 输入：光线击中距离（沿光线的参数t）
+                                              ray.hitT);            // 输入输出：光线累积深度，按权重更新
             
-            // 将粒子的特征（颜色等）按权重累积到光线上
-            particles.featureIntegrateFwd(hitWeight, // 击中权重
-                                          Params::PerRayParticleFeatures ? particles.featuresFromBuffer(hitParticle.idx, ray.direction) : tcnn::max(particleFeatures[hitParticle.idx], 0.f), // 粒子特征
-                                          ray.features); // 光线累积特征
+            // ========== featureIntegrateFwd调用链 - 第1层：K-Buffer渲染器 ==========
+            //
+            // 🎨 【调用链结构】颜色特征的加权混合累积  
+            // 1. 【当前层】K-Buffer (gutKBufferRenderer.cuh:251) → particles.featureIntegrateFwd()
+            // 2. C++包装层 (shRadiativeGaussianParticles.cuh:638) → particleFeaturesIntegrateFwd()
+            // 3. Slang导出层 (shRadiativeParticles.slang:298) → shRadiativeParticle.integrateRadiance<false>()
+            // 4. 核心实现层 (shRadiativeParticles.slang:底层) → 实际特征加权累积
+            //
+            // 【本层作用】：颜色特征的Alpha混合计算
+            // - 获取粒子的颜色/辐射特征（RGB或球谐系数）
+            // - 按权重累积到光线的总颜色中：ray.features += weight * particleFeatures
+            // - 支持静态特征（预计算RGB）和动态特征（球谐光照）两种模式
+            // - 累积结果将成为最终像素的RGB颜色值
+            //
+            particles.featureIntegrateFwd(
+                hitWeight,                                          // 输入：混合权重，由densityIntegrateHit计算得出
+                Params::PerRayParticleFeatures ?                   // 条件分支：特征模式选择
+                    particles.featuresFromBuffer(hitParticle.idx, ray.direction) :  // 动态模式：球谐光照，视角相关
+                    tcnn::max(particleFeatures[hitParticle.idx], 0.f),            // 静态模式：预计算RGB，视角无关
+                ray.features);                                     // 输入输出：光线累积特征，会被更新
 
             if (hitWeight > 0.0f) ray.countHit(); // 统计有效击中次数，用于渲染质量分析
         }
@@ -262,8 +291,68 @@ struct GUTKBufferRenderer : Params {
     }
 
     template <typename TRay>
+    // K-Buffer主渲染函数：处理单条光线与tile内粒子的相互作用
+    static inline __device__ void eval(
+        const threedgut::RenderParameters& params,           // 渲染参数配置
+        TRay& ray,                                           // 光线数据(会被修改)
+        const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,  // 每个tile的粒子范围[start,end]
+        const uint32_t* __restrict__ sortedTileParticleIdxPtr,      // 排序后的粒子索引数组
+        // 这么做的好处是：
+        // 不给参数起名或把名字注释掉，可以避免“未使用参数”的编译警告；
+        // 注释里写上原来的名字，则又保留了文档信息，方便阅读和维护。
+        const tcnn::vec2* __restrict__ /*particlesProjectedPositionPtr*/,     // 未使用：粒子投影位置
+        const tcnn::vec4* __restrict__ /*particlesProjectedConicOpacityPtr*/, // 未使用：粒子投影椭圆+不透明度
+        const float* __restrict__ /*particlesGlobalDepthPtr*/,                // 未使用：粒子全局深度
+        const float* __restrict__ particlesPrecomputedFeaturesPtr,            // 预计算粒子特征(RGB等)
+        threedgut::MemoryHandles parameters,                                  // GPU内存句柄集合
+        tcnn::vec2* __restrict__ /*particlesProjectedPositionGradPtr*/     = nullptr,     // 梯度：位置
+        tcnn::vec4* __restrict__ /*particlesProjectedConicOpacityGradPtr*/ = nullptr,     // 梯度：椭圆+不透明度  
+        float* __restrict__ /*particlesGlobalDepthGradPtr*/                = nullptr,     // 梯度：深度
+        float* __restrict__ particlesPrecomputedFeaturesGradPtr            = nullptr,     // 梯度：特征
+        threedgut::MemoryHandles parametersGradient                        = {}) {        // 梯度内存句柄
+
+        using namespace threedgut;
+
+        // === 计算当前线程的tile和线程索引 ===
+        const uint32_t tileIdx = blockIdx.y * gridDim.x + blockIdx.x;      // 当前处理的tile索引(2D->1D)
+        const uint32_t tileThreadIdx = threadIdx.y * blockDim.x + threadIdx.x;  // 当前线程在tile内的索引
+        
+        // === 获取当前tile内的粒子信息 ===
+        const tcnn::uvec2 tileParticleRangeIndices = sortedTileRangeIndicesPtr[tileIdx];  // 粒子范围[start,end]
+        uint32_t tileNumParticlesToProcess = tileParticleRangeIndices.y - tileParticleRangeIndices.x;  // 要处理的粒子数量
+        const uint32_t tileNumBlocksToProcess = tcnn::div_round_up(tileNumParticlesToProcess, GUTParameters::Tiling::BlockSize);  // 需要的数据块数
+        
+        // === 设置特征缓冲区指针 ===
+        // 根据是否使用per-ray特征(球谐函数等)来决定使用预计算特征还是动态特征
+        const TFeaturesVec* particleFeaturesBuffer = Params::PerRayParticleFeatures ? nullptr : reinterpret_cast<const TFeaturesVec*>(particlesPrecomputedFeaturesPtr);
+        TFeaturesVec* particleFeaturesGradientBuffer = (Params::PerRayParticleFeatures || !Backward) ? nullptr : reinterpret_cast<TFeaturesVec*>(particlesPrecomputedFeaturesGradPtr);
+
+        // === 初始化粒子系统 ===
+        Particles particles;  // 粒子接口对象
+        particles.initializeDensity(parameters);  // 初始化密度计算相关参数
+        if constexpr (Backward) {
+            particles.initializeDensityGradient(parametersGradient);  // 反向模式：初始化密度梯度
+        }
+        particles.initializeFeatures(parameters);  // 初始化特征计算相关参数
+        if constexpr (Backward && Params::PerRayParticleFeatures) {
+            particles.initializeFeaturesGradient(parametersGradient);  // 反向模式：初始化特征梯度
+        }
+
+        // === 根据模式选择处理路径 ===
+        if constexpr (Backward && (Params::KHitBufferSize == 0)) {
+            // 路径1: 反向传播 + 无K缓冲 = 直接处理模式
+            evalBackwardNoKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
+                                  sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
+        } else {
+            // 路径2: 前向传播 或 使用K缓冲 = K-Buffer模式  
+            evalKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
+                        sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
+        }
+    }
+
+    template <typename TRay>
     // 主渲染函数
-    static inline __device__ void eval(const threedgut::RenderParameters& params,
+    static inline __device__ void evalBalanced(const threedgut::RenderParameters& params,
                                        TRay& ray,
                                        const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
                                        const uint32_t* __restrict__ sortedTileParticleIdxPtr,
@@ -271,18 +360,19 @@ struct GUTKBufferRenderer : Params {
                                        const tcnn::vec4* __restrict__ /*particlesProjectedConicOpacityPtr*/,
                                        const float* __restrict__ /*particlesGlobalDepthPtr*/,
                                        const float* __restrict__ particlesPrecomputedFeaturesPtr,
+                                       const tcnn::uvec2& tile,
+                                       const tcnn::uvec2& tileGrid,
                                        threedgut::MemoryHandles parameters,
                                        tcnn::vec2* __restrict__ /*particlesProjectedPositionGradPtr*/     = nullptr,
                                        tcnn::vec4* __restrict__ /*particlesProjectedConicOpacityGradPtr*/ = nullptr,
                                        float* __restrict__ /*particlesGlobalDepthGradPtr*/                = nullptr,
                                        float* __restrict__ particlesPrecomputedFeaturesGradPtr            = nullptr,
                                        threedgut::MemoryHandles parametersGradient                        = {}) {
-
         using namespace threedgut;
 
-        const uint32_t tileIdx                       = blockIdx.y * gridDim.x + blockIdx.x;
+        const int balancedTileIdx = tile.y * tileGrid.x + tile.x;
         const uint32_t tileThreadIdx                 = threadIdx.y * blockDim.x + threadIdx.x;
-        const tcnn::uvec2 tileParticleRangeIndices   = sortedTileRangeIndicesPtr[tileIdx];
+        const tcnn::uvec2 tileParticleRangeIndices   = sortedTileRangeIndicesPtr[balancedTileIdx];
         uint32_t tileNumParticlesToProcess           = tileParticleRangeIndices.y - tileParticleRangeIndices.x;
         const uint32_t tileNumBlocksToProcess        = tcnn::div_round_up(tileNumParticlesToProcess, GUTParameters::Tiling::BlockSize);
         // 其实这个接口代表是使用SH（与dir有关），还是单纯的rgb
@@ -303,10 +393,479 @@ struct GUTKBufferRenderer : Params {
             // 反向传播且不使用K缓冲
             evalBackwardNoKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
                                   sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
+
+        } else if constexpr (Params::KHitBufferSize == 0) {
+            // 前向传播且无K缓冲：使用Gaussian-wise并行优化
+            evalForwardNoKBuffer_optimized(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
+                                  sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
         } else {
-            // 使用K缓冲
+            // 前向传播使用K缓冲：内存优化版本
             evalKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
                         sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
+        }
+    }
+
+    template <typename TRay>
+    // 前向无K缓冲的Gaussian-wise优化版本：简洁高效的实现
+    static inline __device__ void evalForwardNoKBuffer_optimized(
+        TRay& ray,                                    
+        Particles& particles,                         
+        const tcnn::uvec2& tileParticleRangeIndices, 
+        uint32_t tileNumBlocksToProcess,             
+        uint32_t tileNumParticlesToProcess,          
+        const uint32_t tileThreadIdx,                
+        const uint32_t* __restrict__ sortedTileParticleIdxPtr, 
+        const TFeaturesVec* __restrict__ particleFeaturesBuffer,     
+        TFeaturesVec* __restrict__ particleFeaturesGradientBuffer) { 
+        
+        static_assert(!Backward && (Params::KHitBufferSize == 0), "Optimized path for forward pass with no KBuffer");
+        using namespace threedgut;
+        
+        // 适度增大共享内存批处理（避免超限）
+        constexpr uint32_t SHMEM_SIZE_MULTIPLIER = 2;
+        __shared__ PrefetchedParticleData prefetchedParticlesData[GUTParameters::Tiling::BlockSize * SHMEM_SIZE_MULTIPLIER];
+        
+        const uint32_t laneId = tileThreadIdx % 32;
+        const uint32_t expandedBlockSize = GUTParameters::Tiling::BlockSize * SHMEM_SIZE_MULTIPLIER;
+        const uint32_t expandedNumBlocksToProcess = tcnn::div_round_up(tileNumParticlesToProcess, expandedBlockSize);
+        
+        // 主循环：分批处理
+        for (uint32_t i = 0; i < expandedNumBlocksToProcess; i++, tileNumParticlesToProcess -= expandedBlockSize) {
+            
+            if (__syncthreads_and(!ray.isAlive())) break;
+            
+            // === 🏗️ 协作式数据预取 ===
+            uint32_t baseProgress = tileParticleRangeIndices.x + i * expandedBlockSize + tileThreadIdx;
+            
+            for (uint32_t j = 0; j < SHMEM_SIZE_MULTIPLIER; j++) {
+                uint32_t currentProgress = baseProgress + j * GUTParameters::Tiling::BlockSize;
+                uint32_t sharedMemIdx = tileThreadIdx + j * GUTParameters::Tiling::BlockSize;
+                
+                if (currentProgress < tileParticleRangeIndices.y) {
+                    const uint32_t particleIdx = sortedTileParticleIdxPtr[currentProgress];
+                if (particleIdx != GUTParameters::InvalidParticleIdx) {
+                        prefetchedParticlesData[sharedMemIdx] = {particleIdx, particles.fetchDensityParameters(particleIdx)};
+                    } else {
+                        prefetchedParticlesData[sharedMemIdx].idx = GUTParameters::InvalidParticleIdx;
+                    }
+                } else {
+                    prefetchedParticlesData[sharedMemIdx].idx = GUTParameters::InvalidParticleIdx;
+                }
+            }
+            __syncthreads();
+
+            // === Gaussian-wise并行：完全按照render_warp的正确实现
+            //
+            // render_warp证明了gaussian-wise并行是可行的
+            // 关键是正确实现：
+            // 1. 外层循环：遍历32条光线
+            // 2. 内层循环：32线程并行处理高斯点  
+            // 3. 并行前缀积：正确处理透射率依赖
+            // 4. Warp归约：正确累积特征到目标光线
+            
+            uint32_t alignedParticleCount = ((min(expandedBlockSize, tileNumParticlesToProcess) + 31) / 32) * 32;
+            
+            // 外层循环：遍历warp内32条光线（完全参考render_warp）
+            for (uint32_t rayLane = 0; rayLane < 32; rayLane++) {
+                
+                // 检查当前光线状态
+                bool rayDone = __shfl_sync(0xffffffff, !ray.isAlive(), rayLane);
+                if (rayDone) continue;
+                
+                // 获取当前光线的数据（通过shuffle）
+                tcnn::vec3 currentRayOrigin, currentRayDirection;
+                tcnn::vec2 currentRayTMinMax;
+                float currentRayTransmittance, currentRayHitT;
+                TFeaturesVec currentRayFeatures;
+                
+                currentRayOrigin.x = __shfl_sync(0xffffffff, ray.origin.x, rayLane);
+                currentRayOrigin.y = __shfl_sync(0xffffffff, ray.origin.y, rayLane);
+                currentRayOrigin.z = __shfl_sync(0xffffffff, ray.origin.z, rayLane);
+                currentRayDirection.x = __shfl_sync(0xffffffff, ray.direction.x, rayLane);
+                currentRayDirection.y = __shfl_sync(0xffffffff, ray.direction.y, rayLane);
+                currentRayDirection.z = __shfl_sync(0xffffffff, ray.direction.z, rayLane);
+                currentRayTMinMax.x = __shfl_sync(0xffffffff, ray.tMinMax.x, rayLane);
+                currentRayTMinMax.y = __shfl_sync(0xffffffff, ray.tMinMax.y, rayLane);
+                currentRayTransmittance = __shfl_sync(0xffffffff, ray.transmittance, rayLane);
+                currentRayHitT = __shfl_sync(0xffffffff, ray.hitT, rayLane);
+                
+                for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                    currentRayFeatures[featIdx] = __shfl_sync(0xffffffff, ray.features[featIdx], rayLane);
+                }
+                
+                // 临时累积变量（每个线程维护）
+                TFeaturesVec tempFeatures = TFeaturesVec::zero();
+                float tempWeight = 0.0f;
+                float tempDepth = 0.0f;
+                uint32_t tempHitCount = 0;  // 关键修正：统计实际击中次数
+                
+                // 内层循环：32线程并行处理高斯点（核心算法）
+                for (uint32_t j = laneId; j < alignedParticleCount; j += 32) {
+                    
+                    if (rayDone) break;
+                    
+                    float hitAlpha = 0.0f;
+                    float hitT = 0.0f;
+                    TFeaturesVec hitFeatures = TFeaturesVec::zero();
+                    bool validHit = false;
+                    
+                    // 步骤1：每个线程检测一个高斯点
+                    if (j < min(expandedBlockSize, tileNumParticlesToProcess)) {
+                        const PrefetchedParticleData particleData = prefetchedParticlesData[j];
+                        
+                        if (particleData.idx != GUTParameters::InvalidParticleIdx) {
+                            if (particles.densityHit(currentRayOrigin,
+                                                   currentRayDirection,
+                                                   particleData.densityParameters,
+                                                   hitAlpha,
+                                                   hitT) &&
+                                (hitT > currentRayTMinMax.x) &&
+                                (hitT < currentRayTMinMax.y)) {
+                                
+                                validHit = true;
+                                
+                                // 获取高斯点特征
+                                if constexpr (Params::PerRayParticleFeatures) {
+                                    hitFeatures = particles.featuresFromBuffer(particleData.idx, currentRayDirection);
+                                } else {
+                                    hitFeatures = tcnn::max(particleFeaturesBuffer[particleData.idx], 0.f);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 如果warp内无击中，跳过
+                    if (__all_sync(0xffffffff, !validHit)) continue;
+                    
+                    // 步骤2：并行前缀积计算透射率（完全参考render_warp）
+                    float oneMinusAlpha = validHit ? (1.0f - hitAlpha) : 1.0f;
+                    
+                    for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+                        float n = __shfl_up_sync(0xffffffff, oneMinusAlpha, offset);
+                        if (laneId >= offset) {
+                            oneMinusAlpha *= n;
+                        }
+                    }
+                    
+                    // 关键修正：按照render_warp第299行的精确逻辑
+                    float testT = currentRayTransmittance * oneMinusAlpha;  // test_T = w_T * one_alpha
+                    
+                    // 步骤3：早停检测（render_warp第300-308行逻辑）
+                    uint32_t anyDone = __ballot_sync(0xffffffff, testT < Particles::MinTransmittanceThreshold);
+                    if (anyDone) {
+                        if (laneId == rayLane) {
+                            ray.kill();
+                        }
+                        rayDone = true;
+                        break;
+                    }
+                    
+                    // 步骤4：特征积分（render_warp第310-316行的精确逻辑）
+                    float wT = testT;  // 每个线程的局部透射率状态（对应render_warp的w_T）
+                    
+                    if (validHit && testT >= Particles::MinTransmittanceThreshold) {
+                        // 关键修正：按照render_warp第311行恢复透射率
+                        wT /= (1.0f - hitAlpha);  // 恢复处理当前高斯点前的透射率
+                        
+                        // render_warp第313-315行：alpha * test_T 计算权重
+                        float hitWeight = hitAlpha * wT;
+                        
+                        // 累积贡献（完全按照render_warp）
+                        for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                            tempFeatures[featIdx] += hitFeatures[featIdx] * hitWeight;
+                        }
+                        tempWeight += hitWeight;
+                        tempDepth += hitT * hitWeight;
+                        
+                        if (hitWeight > 0.0f) {
+                            tempHitCount++;
+                        }
+                    }
+                    
+                    // 关键修正：按照render_warp第317行同步透射率
+                    // 注意：这里更新的是处理完当前高斯点后的透射率状态
+                    currentRayTransmittance = __shfl_sync(0xffffffff, testT, 31);  // 使用testT而不是wT
+                }
+                
+                // 步骤5：按照render_warp第319-324行的精确归约逻辑
+                
+                // 关键修正：直接按照warp_prefixsum_to_lane实现归约
+                // 特征归约（对应render_warp第322行）
+                for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                    float src = tempFeatures[featIdx];
+                    src += __shfl_up_sync(0xffffffff, src, 1);
+                    src += __shfl_up_sync(0xffffffff, src, 2);
+                    src += __shfl_up_sync(0xffffffff, src, 4);
+                    src += __shfl_up_sync(0xffffffff, src, 8);
+                    src += __shfl_up_sync(0xffffffff, src, 16);
+                    src = __shfl_sync(0xffffffff, src, 31);
+                    if (rayLane == laneId) {
+                        currentRayFeatures[featIdx] += src;  // 对应render_warp: dst += src
+                    }
+                }
+                
+                // 深度归约（对应render_warp第324行w_D）
+                {
+                    float src = tempDepth;
+                    src += __shfl_up_sync(0xffffffff, src, 1);
+                    src += __shfl_up_sync(0xffffffff, src, 2);
+                    src += __shfl_up_sync(0xffffffff, src, 4);
+                    src += __shfl_up_sync(0xffffffff, src, 8);
+                    src += __shfl_up_sync(0xffffffff, src, 16);
+                    src = __shfl_sync(0xffffffff, src, 31);
+                    if (rayLane == laneId) {
+                        currentRayHitT += src;
+                    }
+                }
+                
+                // 命中计数修正：按实际击中的高斯点数量计数
+                // 原始逻辑：每个高斯点如果有贡献(hitWeight > 0)就计数一次
+                // Gaussian-wise版本：统计32个线程中有多少个高斯点有贡献
+                {
+                    uint32_t src = tempHitCount;  // 每个线程统计自己处理的高斯点击中次数
+                    src += __shfl_up_sync(0xffffffff, src, 1);
+                    src += __shfl_up_sync(0xffffffff, src, 2);
+                    src += __shfl_up_sync(0xffffffff, src, 4);
+                    src += __shfl_up_sync(0xffffffff, src, 8);
+                    src += __shfl_up_sync(0xffffffff, src, 16);
+                    src = __shfl_sync(0xffffffff, src, 31);
+                    if (rayLane == laneId) {
+                        // 关键修正：按实际有贡献的高斯点数量调用
+                        // 如果32个线程中总共有N个高斯点有贡献，就调用N次ray.countHit()
+                        for (uint32_t h = 0; h < src; h++) {
+                            ray.countHit();
+                        }
+                    }
+                }
+                
+                // 步骤6：更新目标光线状态（对应render_warp第319-320行）
+                if (laneId == rayLane) {  // 对应render_warp: if (lane_id % 32 == l)
+                    ray.transmittance = currentRayTransmittance;  // T = w_T
+                    ray.hitT = currentRayHitT;
+                    for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                        ray.features[featIdx] = currentRayFeatures[featIdx];
+                    }
+                }
+            }
+        }
+    }
+
+    template <typename TRay>
+    // Fine-grained warp-level处理函数 - 基于gaussian-wise并行 (算法3优化版)
+    static inline __device__ void evalFineGrainedWarp(
+        const threedgut::RenderParameters& params,
+                                       TRay& ray,
+                                       const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
+                                       const uint32_t* __restrict__ sortedTileParticleIdxPtr,
+        const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
+        const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
+        const float* __restrict__ particlesGlobalDepthPtr,
+                                       const float* __restrict__ particlesPrecomputedFeaturesPtr,
+                                       const tcnn::uvec2& tile,
+                                       const tcnn::uvec2& tileGrid,
+        const int laneId,
+                                       threedgut::MemoryHandles parameters,
+        tcnn::vec2* __restrict__ particlesProjectedPositionGradPtr     = nullptr,
+        tcnn::vec4* __restrict__ particlesProjectedConicOpacityGradPtr = nullptr,
+        float* __restrict__ particlesGlobalDepthGradPtr                = nullptr,
+        float* __restrict__ particlesPrecomputedFeaturesGradPtr        = nullptr,
+        threedgut::MemoryHandles parametersGradient                    = {}) {
+
+        using namespace threedgut;
+        
+        // 使用原始16x16 tile的粒子数据，每个warp处理1个pixel
+        const uint32_t tileIdx = tile.y * tileGrid.x + tile.x;
+        const tcnn::uvec2 tileParticleRangeIndices = sortedTileRangeIndicesPtr[tileIdx];
+        
+        uint32_t tileNumParticlesToProcess = tileParticleRangeIndices.y - tileParticleRangeIndices.x;
+        
+        const TFeaturesVec* particleFeaturesBuffer = 
+            Params::PerRayParticleFeatures ? nullptr : 
+            reinterpret_cast<const TFeaturesVec*>(particlesPrecomputedFeaturesPtr);
+        TFeaturesVec* particleFeaturesGradientBuffer = 
+            (Params::PerRayParticleFeatures || !Backward) ? nullptr : 
+            reinterpret_cast<TFeaturesVec*>(particlesPrecomputedFeaturesGradPtr);
+
+        Particles particles;
+        particles.initializeDensity(parameters);
+        if constexpr (Backward) {
+            particles.initializeDensityGradient(parametersGradient);
+        }
+        particles.initializeFeatures(parameters);
+        if constexpr (Backward && Params::PerRayParticleFeatures) {
+            particles.initializeFeaturesGradient(parametersGradient);
+        }
+
+        if constexpr (Params::KHitBufferSize == 0) {
+            // K=0时使用Gaussian-wise并行处理（类似evalForwardNoKBuffer_optimized的单光线版本）
+            
+            uint32_t alignedParticleCount = ((tileNumParticlesToProcess + 31) / 32) * 32;
+            
+            // Gaussian-wise并行：32线程并行处理高斯点，单条光线
+            for (uint32_t j = laneId; j < alignedParticleCount; j += 32) {
+                
+                if (!ray.isAlive()) break;
+                
+                float hitAlpha = 0.0f;
+                float hitT = 0.0f;
+                TFeaturesVec hitFeatures = TFeaturesVec::zero();
+                bool validHit = false;
+                
+                // 🔍 **步骤1：每个线程检测一个高斯点**
+                if (j < tileNumParticlesToProcess) {
+                    const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + j;
+                    const uint32_t particleIdx = sortedTileParticleIdxPtr[toProcessSortedIndex];
+                    
+                    if (particleIdx != GUTParameters::InvalidParticleIdx) {
+                        auto densityParams = particles.fetchDensityParameters(particleIdx);
+                        
+                        if (particles.densityHit(ray.origin,
+                                               ray.direction,
+                                               densityParams,
+                                               hitAlpha,
+                                               hitT) &&
+                            (hitT > ray.tMinMax.x) &&
+                            (hitT < ray.tMinMax.y)) {
+                            
+                            validHit = true;
+                            
+                            // 获取高斯点特征
+                            if constexpr (Params::PerRayParticleFeatures) {
+                                hitFeatures = particles.featuresFromBuffer(particleIdx, ray.direction);
+        } else {
+                                hitFeatures = tcnn::max(particleFeaturesBuffer[particleIdx], 0.f);
+                            }
+                        }
+                    }
+                }
+                
+                // 如果warp内无击中，跳过
+                if (__all_sync(0xffffffff, !validHit)) continue;
+                
+                // 步骤2：计算每个线程的透射率贡献
+                float localTransmittance = validHit ? (1.0f - hitAlpha) : 1.0f;
+                
+                // 步骤3：Warp内前缀积计算累积透射率
+                for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+                    float n = __shfl_up_sync(0xffffffff, localTransmittance, offset);
+                    if (laneId >= offset) {
+                        localTransmittance *= n;
+                    }
+                }
+                
+                // 当前warp处理的粒子批次对ray透射率的影响
+                float batchTransmittance = __shfl_sync(0xffffffff, localTransmittance, 31);
+                float newTransmittance = ray.transmittance * batchTransmittance;
+                
+                // 🚨 **步骤4：早停检测**
+                if (newTransmittance < Particles::MinTransmittanceThreshold) {
+                    ray.kill();
+                    break;
+                }
+                
+                // 💫 **步骤5：Warp内归约计算特征贡献**
+                TFeaturesVec accumulatedFeatures = TFeaturesVec::zero();
+                float accumulatedHitT = 0.0f;
+                uint32_t accumulatedHitCount = 0;
+                
+                if (validHit) {
+                    // 使用已计算的前缀透射率（localTransmittance在当前线程包含了前面所有线程的累积）
+                    // 我们需要的是不包括当前粒子的前缀透射率
+                    float prefixTransmittance = (laneId > 0) ? 
+                        (localTransmittance / (1.0f - hitAlpha)) : 1.0f;
+                    float particleTransmittance = ray.transmittance * prefixTransmittance;
+                    float hitWeight = hitAlpha * particleTransmittance;
+                    
+                    // 计算特征贡献
+                    for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                        accumulatedFeatures[featIdx] = hitFeatures[featIdx] * hitWeight;
+                    }
+                    accumulatedHitT = hitT * hitWeight;
+                    accumulatedHitCount = (hitWeight > 0.0f) ? 1 : 0;
+                }
+                
+                // 步骤6：Warp内归约求和
+                for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                    for (uint32_t offset = 16; offset > 0; offset /= 2) {
+                        accumulatedFeatures[featIdx] += __shfl_down_sync(0xffffffff, accumulatedFeatures[featIdx], offset);
+                    }
+                }
+                
+                for (uint32_t offset = 16; offset > 0; offset /= 2) {
+                    accumulatedHitT += __shfl_down_sync(0xffffffff, accumulatedHitT, offset);
+                    accumulatedHitCount += __shfl_down_sync(0xffffffff, accumulatedHitCount, offset);
+                }
+                
+                // 步骤7：只有lane 0更新ray（避免数据竞争）
+                if (laneId == 0) {
+                    for (int featIdx = 0; featIdx < Particles::FeaturesDim; ++featIdx) {
+                        ray.features[featIdx] += accumulatedFeatures[featIdx];
+                    }
+                    ray.hitT += accumulatedHitT;
+                    ray.countHit(accumulatedHitCount);
+                }
+                
+                // 步骤8：更新透射率
+                ray.transmittance = newTransmittance;
+            }
+            
+        } else {
+            // K>0时使用传统K-Buffer处理
+            
+            HitParticleKBuffer<Params::KHitBufferSize> hitParticleKBuffer;
+            const uint32_t tileNumWarpIterations = tcnn::div_round_up(tileNumParticlesToProcess, 32u);
+            
+            for (uint32_t i = 0; i < tileNumWarpIterations; i++, tileNumParticlesToProcess -= 32) {
+                
+                if (__all_sync(0xFFFFFFFF, !ray.isAlive())) {
+                    break;
+                }
+                
+                // 每个lane处理一个粒子
+                uint32_t particleIdx = GUTParameters::InvalidParticleIdx;
+                const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + i * 32 + laneId;
+                
+                if (toProcessSortedIndex < tileParticleRangeIndices.y) {
+                    particleIdx = sortedTileParticleIdxPtr[toProcessSortedIndex];
+                }
+                
+                if (particleIdx != GUTParameters::InvalidParticleIdx && ray.isAlive()) {
+                    
+                    HitParticle hitParticle;
+                    hitParticle.idx = particleIdx;
+                    
+                    auto densityParams = particles.fetchDensityParameters(particleIdx);
+                    
+                    if (particles.densityHit(ray.origin,
+                                           ray.direction,
+                                           densityParams,
+                                           hitParticle.alpha,
+                                           hitParticle.hitT) &&
+                        (hitParticle.hitT > ray.tMinMax.x) &&
+                        (hitParticle.hitT < ray.tMinMax.y)) {
+                        
+                        // K-Buffer插入逻辑
+                        if (hitParticleKBuffer.full()) {
+                            processHitParticle(ray,
+                                             hitParticleKBuffer.closestHit(hitParticle),
+                                             particles,
+                                             particleFeaturesBuffer,
+                                             particleFeaturesGradientBuffer);
+                        }
+                        
+                        hitParticleKBuffer.insert(hitParticle);
+                    }
+                }
+            }
+            
+            // 处理K-Buffer中剩余的击中
+            for (int i = 0; ray.isAlive() && (i < hitParticleKBuffer.numHits()); ++i) {
+                processHitParticle(ray,
+                                 hitParticleKBuffer[Params::KHitBufferSize - hitParticleKBuffer.numHits() + i],
+                                 particles,
+                                 particleFeaturesBuffer,
+                                 particleFeaturesGradientBuffer);
+            }
         }
     }
 

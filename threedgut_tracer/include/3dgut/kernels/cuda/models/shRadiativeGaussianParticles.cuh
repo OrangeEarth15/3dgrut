@@ -177,7 +177,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
         static_assert(sizeof(DensityParameters) == sizeof(gaussianParticle_Parameters_0), 
                      "Sizes must match for binary compatibility");
         
-        // 🎯 建立类型化指针映射：从通用内存句柄获取具体类型的缓冲区指针
+        // 这是一个典型的类型安全的内存映射过程，将抽象的内存句柄转换为具体的类型化指针，实现高效的GPU数据访问！
         m_densityRawParameters.ptr =
             parameters.bufferPtr<DensityRawParameters>(Params::DensityRawParametersBufferIndex);
     }
@@ -340,20 +340,43 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                   reinterpret_cast<float3*>(normal));                   // 法线指针转换（可为空）
     }
 
-    // 密度穿透性积分计算
+    // ========== densityIntegrateHit调用链 - 第2层：C++包装接口 ==========
+    //
+    // 🔗 【调用链位置】：
+    // 1. K-Buffer (gutKBufferRenderer.cuh:244) → particles.densityIntegrateHit()
+    // 2. 【当前层】C++包装 (shRadiativeGaussianParticles.cuh:344) → particleDensityIntegrateHit()
+    // 3. Slang导出 (gaussianParticles.slang:873) → gaussianParticle.integrateHit<false>()
+    // 4. 核心实现 (gaussianParticles.slang:551) → 实际Alpha混合计算
+    //
+    // 【本层作用】：类型转换和参数适配层
+    // - 将TCNN类型转换为CUDA原生类型：tcnn::vec3* → float3*
+    // - 将C++引用参数转换为指针参数：float& → float*
+    // - 处理可选参数的逻辑：normal指针的空值检查和默认值设置
+    // - 提供类型安全的接口，隐藏底层Slang实现细节
+    //
+    // 📊 【参数转换映射】：
+    // alpha (float) → alpha (float)                    // 直接传递
+    // transmittance (float&) → &transmittance (float*) // 引用转指针
+    // depth (float) → depth (float)                    // 直接传递
+    // integratedDepth (float&) → &integratedDepth (float*) // 引用转指针
+    // normal (tcnn::vec3*) → *reinterpret_cast<float3*>(normal) // 类型转换
+    //
     __forceinline__ __device__ float densityIntegrateHit(float alpha,
                                                          float& transmittance,
                                                          float depth,
                                                          float& integratedDepth,
                                                          const tcnn::vec3* normal     = nullptr,
                                                          tcnn::vec3* integratedNormal = nullptr) const {
-        return particleDensityIntegrateHit(alpha,
-                                           &transmittance,
-                                           depth,
-                                           &integratedDepth,
-                                           normal != nullptr,
-                                           normal == nullptr ? make_float3(0, 0, 0) : *reinterpret_cast<const float3*>(&normal),
-                                           reinterpret_cast<float3*>(integratedNormal));
+        // ========== 类型转换和参数转发 ==========
+        // 功能：将C++风格的API转换为Slang兼容的C风格API
+        // 关键：确保内存布局兼容性和参数传递的正确性
+        return particleDensityIntegrateHit(alpha,                      // 直接传递不透明度值
+                                           &transmittance,              // 引用转指针：透射率（输入输出）
+                                           depth,                       // 直接传递深度值
+                                           &integratedDepth,            // 引用转指针：积分深度（输入输出）
+                                           normal != nullptr,           // 布尔标志：是否需要计算法线
+                                           normal == nullptr ? make_float3(0, 0, 0) : *reinterpret_cast<const float3*>(&normal), // 法线转换或默认值
+                                           reinterpret_cast<float3*>(integratedNormal)); // 积分法线指针转换
     }
 
     // 从缓冲区处理密度光线击中（前向）
@@ -620,28 +643,39 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
 
     // ========== 体积渲染积分接口：颜色的混合与累积 ==========
     
-    /**
-     * 特征前向积分（直接积分模式）
-     * 
-     * 功能：将单个粒子的辐射特征按权重积分到总颜色中
-     * 数学：integratedFeatures += weight * features
-     * 
-     * 应用场景：
-     * - 传统的前向后渲染顺序
-     * - 体积渲染中的视线穿越积分
-     * - K-Buffer中的局部积分计算
-     * 
-     * @param weight 混合权重（通常是alpha * transmittance）
-     * @param features 当前粒子的辐射特征
-     * @param integratedFeatures 累积的特征结果（输入输出）
-     */
+    // ========== featureIntegrateFwd调用链 - 第2层：C++包装接口 ==========
+    //
+    // 🎨 【调用链位置】：
+    // 1. K-Buffer (gutKBufferRenderer.cuh:264) → particles.featureIntegrateFwd()
+    // 2. 【当前层】C++包装 (shRadiativeGaussianParticles.cuh:661) → particleFeaturesIntegrateFwd()
+    // 3. Slang导出 (shRadiativeParticles.slang:299) → shRadiativeParticle.integrateRadiance<false>()
+    // 4. 核心实现 (shRadiativeParticles.slang:205) → 颜色混合算法
+    //
+    // 【本层作用】：辐射特征的类型转换和接口适配
+    // - 功能：将单个粒子的辐射特征按权重积分到总颜色中
+    // - 数学公式：integratedFeatures += weight * features
+    // - 类型转换：TFeaturesVec (tcnn::vec3) → float3
+    // - 提供类型安全的模板化API接口
+    //
+    // 【应用场景】：
+    // - 传统的前向后渲染顺序（front-to-back rendering）
+    // - 体积渲染中的视线穿越积分（ray marching integration）
+    // - K-Buffer中的局部积分计算（local integration in K-Buffer）
+    //
+    // 📊 【参数转换映射】：
+    // weight (float) → weight (float)                                               // 直接传递权重值
+    // features (TFeaturesVec&) → *reinterpret_cast<float3*>(&features)               // TCNN向量转CUDA类型
+    // integratedFeatures (TFeaturesVec&) → reinterpret_cast<float3*>(&integratedFeatures) // 累积结果转换
+    //
     __forceinline__ __device__ void featureIntegrateFwd(float weight,
                                                         const TFeaturesVec& features,
                                                         TFeaturesVec& integratedFeatures) const {
-        // 🌨️ 调用Slang实现的前向积分算法
-        particleFeaturesIntegrateFwd(weight,
-                                     *reinterpret_cast<const float3*>(&features),
-                                     reinterpret_cast<float3*>(&integratedFeatures));
+        // ========== TCNN向量类型到CUDA原生类型的转换 ==========
+        // 功能：将高层模板化的向量类型转换为底层Slang兼容的数据类型
+        // 关键：reinterpret_cast确保内存布局兼容性，避免数据拷贝开销
+        particleFeaturesIntegrateFwd(weight,                                          // 权重值直接传递
+                                     *reinterpret_cast<const float3*>(&features),     // 粒子特征向量转换
+                                     reinterpret_cast<float3*>(&integratedFeatures)); // 累积结果向量转换
     }
 
     /**

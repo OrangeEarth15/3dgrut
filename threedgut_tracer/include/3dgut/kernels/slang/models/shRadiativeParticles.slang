@@ -190,35 +190,84 @@ vector<float, Dim> radianceFromBuffer(no_diff uint32_t particleIdx,
                incidentDirection);
 }
 
+// ========== integrateRadiance调用链 - 第4层：核心实现算法 ==========
+//
+// 🎨 【调用链终点】：
+// 1. K-Buffer (gutKBufferRenderer.cuh:264) → particles.featureIntegrateFwd()
+// 2. C++包装 (shRadiativeGaussianParticles.cuh:661) → particleFeaturesIntegrateFwd()
+// 3. Slang导出 (shRadiativeParticles.slang:299) → shRadiativeParticle.integrateRadiance<false>()
+// 4. 【当前层】核心实现 (shRadiativeParticles.slang:205) → 颜色混合算法
+//
+// 【本层作用】：球谐辐射粒子的颜色混合数学实现
+// - 这是颜色调用链的最底层，实现真正的颜色混合算法
+// - 支持两种混合模式：直接累积和线性插值
+// - 适配不同的渲染算法：K-Buffer、排序透明、Over混合
+// - 通过模板参数在编译时优化性能
+//
+// 🌌 【球谐光照背景】：
+// - 传统3DGS：每个粒子 → 固定RGB颜色
+// - 球谐3DGS：每个粒子 → 球谐系数数组 → 基于观察方向计算颜色
+// - 计算流程：存储系数 → 球谐基函数解码 → 按权重混合
+// - 优势：紧凑表示、连续插值、视角相关光照效果
+//
+// 🎨 【数学原理】：
+// 颜色混合公式（与Alpha混合对应）：
+// 前向后模式：integratedColor += particleColor × weight
+// 后向前模式：integratedColor = lerp(oldColor, particleColor, weight)
+// 其中 weight = alpha × transmittance (由densityIntegrateHit计算)
+//
+// 📊 【性能优化】：
+// - [BackwardDifferentiable] 支持自动微分，用于神经网络训练
+// - [ForceInline] 强制内联展开，减少函数调用开销
+// - 模板特化 <let backToFront : bool> 编译时分支消除
+// - weight > 0.0f 早期退出优化，避免无效计算
+//
 /**
- * 积分辐射亮度（体积渲染混合）
+ * 积分辐射亮度（体积渲染混合）- 核心实现算法
  * 
- * 实现体积渲染中的辐射亮度积分，支持两种混合模式：
- * 1. 前向后模式：直接累加权重值
+ * 【核心功能】：
+ * 这是3DGUT系统中颜色混合的数学核心，实现体积渲染中的辐射亮度积分。
+ * 支持两种混合模式，通过模板参数在编译时优化：
+ * 1. 前向后模式：直接累加权重值 (K-Buffer使用)
  * 2. 后向前模式：使用线性插值混合（适用于预积分的alpha混合）
  * 
- * @param weight 混合权重（alpha值或透射率加权）
- * @param radiance 当前粒子的辐射亮度
- * @param integratedRadiance 累积的辐射亮度（输入输出参数）
+ * 这个函数处理：
+ * - 球谐辐射特征的数值积分
+ * - 多层透明粒子的颜色合成
+ * - 视角相关光照效果的累积
+ * 
+ * @param weight 混合权重（由densityIntegrateHit计算：alpha × transmittance）
+ * @param radiance 当前粒子的辐射亮度向量（RGB或球谐解码结果）
+ * @param integratedRadiance 累积的辐射亮度（输入输出参数，最终像素颜色）
  */
 [BackwardDifferentiable][ForceInline]
 void integrateRadiance<let backToFront : bool>(float weight,
                                                in vector<float, Dim> radiance,
                                                inout vector<float, Dim> integratedRadiance)
 {
+    // ========== 步骤1：早期退出优化 ==========
+    // 关键：只有有效权重的粒子才进行颜色混合
+    // 避免无效计算，提高GPU执行效率
     if (weight > 0.0f)
     {
+        // ========== 步骤2：根据渲染模式选择混合算法 ==========
         if (backToFront)
         {
             // 后向前模式：线性插值混合（Over算子）
+            // 公式：result = lerp(old, new, weight) = old * (1-weight) + new * weight
+            // 适用于：深度排序渲染、Alpha混合等
             integratedRadiance = lerp(integratedRadiance, radiance, weight);
         }
         else
         {
             // 前向后模式：直接累加（正向穿越）
+            // 公式：result += radiance * weight (加权平均)
+            // 适用于：K-Buffer、体积渲染等
+            // 关键：这是3DGUT中K-Buffer使用的主要模式
             integratedRadiance += radiance * weight;
         }
     }
+    // 注意：函数为void类型，直接修改integratedRadiance参数
 }
 
 [BackwardDifferentiable][ForceInline]
@@ -285,25 +334,62 @@ inline vector<float, shRadiativeParticle.Dim> particleFeaturesFromBuffer(in uint
         incidentDirection);
 }
 
+// ========== particleFeaturesIntegrateFwd调用链 - 第3层：Slang导出接口 ==========
+//
+// 🎨 【调用链位置】：
+// 1. K-Buffer (gutKBufferRenderer.cuh:264) → particles.featureIntegrateFwd()
+// 2. C++包装 (shRadiativeGaussianParticles.cuh:661) → particleFeaturesIntegrateFwd()
+// 3. 【当前层】Slang导出 (shRadiativeParticles.slang:299) → shRadiativeParticle.integrateRadiance<false>()
+// 4. 核心实现 (shRadiativeParticles.slang:205) → 颜色混合算法
+//
+// 【本层作用】：辐射特征积分的跨语言导出接口
+// - [CudaDeviceExport] 使得Slang函数可以被CUDA C++代码调用
+// - 提供稳定的ABI边界，隔离底层球谐光照实现细节
+// - 纯转发函数，直接调用球谐辐射粒子的积分算法
+// - 确保向量类型兼容性和参数传递正确性
+//
+// 【渲染模式】：
+// - 使用前向后遍历模式 (backToFront=false)
+// - 直接累积模式：integratedFeatures += features * weight
+// - 适用于正向穿越的颜色积分 (front-to-back color integration)
+//
+// 🌌 【球谐光照原理】：
+// - shRadiativeParticle 代表支持球谐基函数的辐射粒子
+// - 每个粒子存储一组球谐系数，而不是固定的RGB值
+// - 根据观察方向动态计算颜色，实现视角相关的光照效果
+// - 支持复杂的光照现象：镜面反射、次表面散射、各向异性材质
+//
+// 📊 【核心公式】（将在第4层实现）：
+// if (weight > 0.0f) {
+//     integratedFeatures += features * weight;  // 直接累积模式
+// }
+//
 /**
- * 粒子特征前向积分
+ * 粒子特征前向积分 - Slang导出接口
+ * 
+ * 功能：为CUDA C++代码提供调用Slang实现的特征积分功能的接口
+ * 作用：这是一个纯转发函数，将调用直接传递给内部的shRadiativeParticle.integrateRadiance()
  * 
  * 对粒子的辐射特征进行前向积分（前向后遍历模式）。
  * 用于体积渲染中的颜色积分计算。
  * 
- * @param weight 混合权重
- * @param features 当前粒子的辐射特征
- * @param integratedFeatures 累积的辐射特征（输入输出）
+ * @param weight 混合权重（由前面的densityIntegrateHit计算得出）
+ * @param features 当前粒子的辐射特征向量（RGB或球谐系数）
+ * @param integratedFeatures 累积的辐射特征（输入输出，会被修改）
  */
 [CudaDeviceExport]
 inline void particleFeaturesIntegrateFwd(in float weight,
                                          in vector<float, shRadiativeParticle.Dim> features,
                                          inout vector<float, shRadiativeParticle.Dim> integratedFeatures)
 {
+    // ========== 直接转发到球谐辐射粒子的核心积分算法 ==========
+    // 功能：将所有参数传递给真正的球谐辐射积分实现
+    // 模板参数：<false> 表示使用前向后渲染模式的直接累积
+    // 返回类型：void，直接修改integratedFeatures参数
     shRadiativeParticle.integrateRadiance<false>(
-        weight,
-        features,
-        integratedFeatures
+        weight,              // 混合权重（alpha * transmittance）
+        features,            // 当前粒子的辐射特征
+        integratedFeatures   // 累积的辐射特征（输入输出）
     );
 }
 

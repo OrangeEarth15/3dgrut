@@ -56,6 +56,9 @@ def setup_3dgut(conf):
         f"-DGAUSSIAN_N_ROLLING_SHUTTER_ITERATIONS={conf.render.splat.n_rolling_shutter_iterations}",
         f"-DGAUSSIAN_K_BUFFER_SIZE={conf.render.splat.k_buffer_size}",
         f"-DGAUSSIAN_GLOBAL_Z_ORDER={to_cpp_bool(conf.render.splat.global_z_order)}",
+        # -- Performance Optimizations --
+        f"-DDYNAMIC_LOAD_BALANCING={to_cpp_bool(conf.render.splat.dynamic_load_balancing)}",
+        f"-DFINE_GRAINED_LOAD_BALANCING={to_cpp_bool(getattr(conf.render.splat, 'fine_grained_load_balancing', False))}",
         # -- Unscented Transform --
         f"-DGAUSSIAN_UT_ALPHA={ut_alpha}",
         f"-DGAUSSIAN_UT_BETA={ut_beta}",
@@ -83,6 +86,8 @@ def setup_3dgut(conf):
         "-U__CUDA_NO_HALF2_OPERATORS__",
         # 开启CUDA高性能选项
         "-use_fast_math", "-O3",
+        # 添加调试信息支持NCU profiling
+        "-lineinfo", "-g",
         *defines,
     ]
 

@@ -129,6 +129,9 @@ struct GUTRenderer::GutRenderForwardContext {
         particlesGlobalDepthGradient.clear(processQueueHandle, logger);
         particlesPrecomputedFeaturesGradient.clear(processQueueHandle, logger);
         scanningWorkingBuffer.clear(processQueueHandle, logger);
+#if DYNAMIC_LOAD_BALANCING || FINE_GRAINED_LOAD_BALANCING
+        nextTileCounter.clear(processQueueHandle, logger);
+#endif
     }
 
     CudaBuffer unsortedTileDepthKeys; // 未排序的tile深度键
@@ -180,6 +183,10 @@ struct GUTRenderer::GutRenderForwardContext {
     mutable CudaBuffer particlesGlobalDepthGradient;           ///< particles global depth
     mutable CudaBuffer particlesPrecomputedFeaturesGradient;   ///< precomputed particle features float [NxFeaturesDim]
     CudaBuffer scanningWorkingBuffer;                          ///< working buffer to compute the cumulative sum of particles/tiles intersections number
+    
+#if DYNAMIC_LOAD_BALANCING || FINE_GRAINED_LOAD_BALANCING
+    CudaBuffer nextTileCounter;                                    ///< atomic counter for dynamic load balancing tile assignment
+#endif
 
     inline Status updateParticlesWorkingBuffers(int numParticles, cudaStream_t cudaStream, const Logger& logger) {
         const bool uptodate = particlesTilesCount.size() >= numParticles * sizeof(uint32_t);
@@ -392,8 +399,52 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
 
     {
         const auto renderProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render::render"};
-        ::render<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
-            params, // threedgut::RenderParameters params
+        
+#if DYNAMIC_LOAD_BALANCING || FINE_GRAINED_LOAD_BALANCING
+        // 初始化动态负载均衡的计数器
+        const uint64_t queueHandle = reinterpret_cast<uint64_t>(cudaStream);
+        CHECK_STATUS_RETURN(m_forwardContext->nextTileCounter.resize(sizeof(uint32_t), queueHandle, m_logger));
+        
+        // 添加调试信息
+        // LOG_INFO(m_logger, "Dynamic load balancing: nextTileCounter allocated at %p, size %zu", 
+        //          m_forwardContext->nextTileCounter.data(), m_forwardContext->nextTileCounter.size());
+        
+        uint32_t initialValue = 0;
+        CUDA_CHECK_RETURN(cudaMemcpyAsync(m_forwardContext->nextTileCounter.data(), &initialValue, sizeof(uint32_t), cudaMemcpyHostToDevice, cudaStream), m_logger);
+        
+        // 同步确保初始化完成
+        CUDA_CHECK_RETURN(cudaStreamSynchronize(cudaStream), m_logger);
+        // LOG_INFO(m_logger, "nextTileCounter initialized successfully");
+#endif
+        
+        // 简单直接的CUDA事件计时
+        cudaEvent_t startEvent, stopEvent;
+        cudaEventCreate(&startEvent);
+        cudaEventCreate(&stopEvent);
+        cudaEventRecord(startEvent, cudaStream);
+        
+        // 根据配置选择不同的负载均衡策略
+#if FINE_GRAINED_LOAD_BALANCING
+        // Fine-grained load balancing enabled
+        // Algorithm 3 line 21-27: Fine-grained launch configuration
+        
+        // 计算virtual tiles总数 (每个原始tile产生32个virtual tiles)
+        const uint32_t virtual_tiles_per_original_tile = 32; // (16*16) / 8
+        const uint32_t virtual_tiles_total = tileGrid.x * tileGrid.y * virtual_tiles_per_original_tile;
+        
+        // 计算最大硬件资源 (Algorithm 3 line 25)
+        int smCount;
+        cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, 0);
+        const uint32_t max_hw_resource = smCount * 16; // 16 blocks per SM
+        
+        // Algorithm 3 line 26: Launch with maximum hardware resource
+        const uint32_t numBlocks = min(max_hw_resource, virtual_tiles_total);
+        
+        LOG_INFO(m_logger, "Fine-grained load balancing: virtualTiles=%u, numBlocks=%u, threadsPerBlock=256", 
+                    virtual_tiles_total, numBlocks);
+        
+        ::renderFineGrainBalanced<<<numBlocks, 256, 0, cudaStream>>>( // 256 threads = 8 warps * 32 threads
+            params,
             (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
             (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
             (const tcnn::vec3*)sensorRayOriginCudaPtr,
@@ -406,7 +457,60 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(),
             (const float*)m_forwardContext->particlesGlobalDepth.data(),
             (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
-            parameters.m_dptrParametersBuffer);
+            parameters.m_dptrParametersBuffer,
+            (uint32_t*)m_forwardContext->nextTileCounter.data(),
+            tcnn::uvec2{tileGrid.x, tileGrid.y}
+        );
+            
+#else
+        // Fine-grained load balancing disabled, use dynamic or static
+#if DYNAMIC_LOAD_BALANCING
+            // 动态负载均衡：优化为完整waves避免tail effect (H200: 660 blocks/wave)
+            const uint32_t numBlocksX = min(tileGrid.x, 66u);  // 66×60=3960 blocks = 6×660 (6完整waves)
+            const uint32_t numBlocksY = min(tileGrid.y, 60u);
+            
+            // 批量动态负载均衡: tileGrid(195, 130), blocks(66, 60)
+            // LOG_INFO(m_logger, "Dynamic load balancing launch: tileGrid(%u, %u), blocks(%u, %u), threads(%u, %u)", 
+            //          tileGrid.x, tileGrid.y, numBlocksX, numBlocksY, 
+            //          GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY);
+            // LOG_INFO(m_logger, "nextTileCounter pointer: %p", (uint32_t*)m_forwardContext->nextTileCounter.data());
+            
+            ::renderDynamic<<<dim3{numBlocksX, numBlocksY, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
+#else
+            ::render<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
+#endif
+                params, // threedgut::RenderParameters params
+                (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
+                (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
+                (const tcnn::vec3*)sensorRayOriginCudaPtr,
+                (const tcnn::vec3*)sensorRayDirectionCudaPtr,
+                sensorPoseToMat(sensorPoseInv),
+                worldHitCountCudaPtr,
+                worldHitDistanceCudaPtr,
+                radianceDensityCudaPtr,
+                (const tcnn::vec2*)m_forwardContext->particlesProjectedPosition.data(),
+                (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(),
+                (const float*)m_forwardContext->particlesGlobalDepth.data(),
+                (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
+                parameters.m_dptrParametersBuffer
+#if DYNAMIC_LOAD_BALANCING
+                ,
+                (uint32_t*)m_forwardContext->nextTileCounter.data(),
+                tcnn::uvec2{tileGrid.x, tileGrid.y}
+#endif
+            );
+#endif
+        
+        cudaEventRecord(stopEvent, cudaStream);
+        cudaEventSynchronize(stopEvent);
+        
+        float elapsedTime;
+        cudaEventElapsedTime(&elapsedTime, startEvent, stopEvent);
+        LOG_INFO(m_logger, "render kernel took %.3f ms", elapsedTime);
+        
+        cudaEventDestroy(startEvent);
+        cudaEventDestroy(stopEvent);
+        
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }
     return Status();

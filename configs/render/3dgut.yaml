@@ -24,3 +24,6 @@ splat: # 3DGUT-specific settings
   # rendering
   k_buffer_size: 0  # 0 means unsorted
   global_z_order: true
+  # performance optimization
+  dynamic_load_balancing: false
+  fine_grained_load_balancing: false
