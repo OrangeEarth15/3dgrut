@@ -38,5 +38,6 @@ playground/assets/
 assets/nvidia-hq.gif
 assets/playground_glass.gif
 
-threedgut_tracer/tests
+
 docs/
+threedgut_tracer/tests/baselines/
