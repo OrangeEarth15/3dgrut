@@ -82,74 +82,6 @@ __global__ void expandTileProjections(tcnn::uvec2 tileGrid,
                           unsortedTileParticleIdxPtr);
 }
 
-// 主渲染CUDA内核
-// rm -rf /home/sarawang/.cache/torch_extensions/py311_cu128/lib3dgut_cc/
-__global__ void renderDynamic(threedgut::RenderParameters params,
-                        const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
-                        const uint32_t* __restrict__ sortedTileDataPtr,
-                        const tcnn::vec3* __restrict__ sensorRayOriginPtr,
-                        const tcnn::vec3* __restrict__ sensorRayDirectionPtr,
-                        tcnn::mat4x3 sensorToWorldTransform,
-                        float* __restrict__ worldHitCountPtr,
-                        float* __restrict__ worldHitDistancePtr,
-                        tcnn::vec4* __restrict__ radianceDensityPtr,
-                        const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
-                        const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
-                        const float* __restrict__ particlesGlobalDepthPtr,
-                        const float* __restrict__ particlesPrecomputedFeaturesPtr,
-                        const uint64_t* __restrict__ parameterMemoryHandles,
-                        uint32_t* __restrict__ nextTileCounterPtr,
-                        const tcnn::uvec2 tileGrid
-                        ) {
-        __shared__ uint32_t shared_tile_id;
-
-        // 第一次获取tile ID
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            shared_tile_id = atomicAdd(nextTileCounterPtr, 1);
-        }
-        __syncthreads();
-
-        // 循环处理tiles直到没有更多工作
-        while (shared_tile_id < tileGrid.x * tileGrid.y) {
-            const tcnn::uvec2 tile = {shared_tile_id % tileGrid.x, shared_tile_id / tileGrid.x};
-            const tcnn::uvec2 pixel = {
-                tile.x * threedgut::GUTParameters::Tiling::BlockX + threadIdx.x,
-                tile.y * threedgut::GUTParameters::Tiling::BlockY + threadIdx.y
-            };
-
-        // // 检查pixel是否在有效范围内，但不要return，而是continue到下一个tile
-        // if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) {
-        //     continue;
-        // }
-
-        auto ray = initializeRayPerPixel<TGUTRenderer::TRayPayload>(
-        params, pixel, sensorRayOriginPtr, sensorRayDirectionPtr, sensorToWorldTransform);
-
-        TGUTRenderer::evalBalanced(params,
-                ray,
-                sortedTileRangeIndicesPtr,
-                sortedTileDataPtr,
-                particlesProjectedPositionPtr,
-                particlesProjectedConicOpacityPtr,
-                particlesGlobalDepthPtr,
-                particlesPrecomputedFeaturesPtr,
-                tile,
-                tileGrid,
-                {parameterMemoryHandles});
-
-        // TGUTModel::eval(params, ray, {parameterMemoryHandles});
-
-        // NB : finalize ray is not differentiable (has to be no-op when used in a differentiable renderer)
-        finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
-
-        // 获取下一个tile ID
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            shared_tile_id = atomicAdd(nextTileCounterPtr, 1);
-        }
-        __syncthreads();
-        }  // 结束while循环
-
-}
 
 // Fine-grained负载均衡渲染内核 (基于论文Algorithm 3)
 __global__ void renderFineGrainBalanced(threedgut::RenderParameters params,
@@ -166,96 +98,81 @@ __global__ void renderFineGrainBalanced(threedgut::RenderParameters params,
                                        const float* __restrict__ particlesGlobalDepthPtr,
                                        const float* __restrict__ particlesPrecomputedFeaturesPtr,
                                        const uint64_t* __restrict__ parameterMemoryHandles,
-                                       uint32_t* __restrict__ nextVirtualTileCounterPtr,
                                        const tcnn::uvec2 tileGrid) {
     
-    // 实现论文Algorithm 3的核心逻辑
-    __shared__ uint32_t shared_virtual_tile_id;
+    // 静态分配，每个block处理一个virtual tile
+    // 每个block对应一个virtual tile ID
+    const uint32_t virtual_tile_id = blockIdx.x;
     
-    // 计算总的virtual tiles数量 (Algorithm 3 line 23)  
-    // 每个原始16x16 tile产生32个virtual tiles（每个8pixels，1个warp处理1个pixel）
-    const uint32_t virtual_tiles_per_original_tile = 32; // (16*16) / 8
+    // 计算总的virtual tiles数量
+    const uint32_t virtual_tiles_per_original_tile = 64; // (16*16) / 4
     const uint32_t total_virtual_tiles = tileGrid.x * tileGrid.y * virtual_tiles_per_original_tile;
     
-    // Algorithm 3 line 4-6: 原子获取virtual tile ID
-    if (threadIdx.x == 0) {
-        shared_virtual_tile_id = atomicAdd(nextVirtualTileCounterPtr, 1);
-    }
-    __syncthreads(); // Algorithm 3 line 3, 7
+    // 边界检查
+    if (virtual_tile_id >= total_virtual_tiles) return;
+        
+    // 将virtual tile映射回原始16x16 tile和4个pixels位置
+    const uint32_t original_tile_id = virtual_tile_id / virtual_tiles_per_original_tile; // 除64得到真正的tile id
+    const uint32_t virtual_tile_in_original = virtual_tile_id % virtual_tiles_per_original_tile; // 取余64的到在大tile中的小tile编号
     
-    while (shared_virtual_tile_id < total_virtual_tiles) { // Algorithm 3 line 2, 8-10
+    const uint32_t original_tile_x = original_tile_id % tileGrid.x;
+    const uint32_t original_tile_y = original_tile_id / tileGrid.x;
+    
+    // 将virtual tile映射到pixels区域
+    // 64个virtual tiles按8x8方式排列在16x16 tile内，每个virtual tile = 2x2 pixels
+    const uint32_t virtual_tile_x = virtual_tile_in_original % 8;  // 0-7
+    const uint32_t virtual_tile_y = virtual_tile_in_original / 8;  // 0-7
+    
+    // 每个virtual tile对应2x2的pixels区域 (width=2, height=2)
+    const uint32_t base_pixel_x = virtual_tile_x * 2;  // 0,2,4,6,8,10,12,14
+    const uint32_t base_pixel_y = virtual_tile_y * 2;  // 0,2,4,6,8,10,12,14
+    
+    // Algorithm 3 line 11: 4个warps分别处理2x2区域内的4个pixels
+    const uint32_t warpId = threadIdx.x / 32;
+    const uint32_t laneId = threadIdx.x % 32;
+    
+    // 每个block处理1个virtual tile = 4个pixels，每个warp处理1个pixel
+    if (warpId < 4) { // 4 warps per block (每个warp处理1个pixel)
+        // 在2x2区域内按行优先排列4个pixels
+        // warp 0-3 对应 pixels: (0,0),(1,0),(0,1),(1,1)
+        const uint32_t pixel_offset_x = warpId % 2;      // 0,1,0,1
+        const uint32_t pixel_offset_y = warpId / 2;      // 0,0,1,1
         
-        // 将virtual tile映射回原始16x16 tile和8个pixels位置
-        const uint32_t original_tile_id = shared_virtual_tile_id / virtual_tiles_per_original_tile;
-        const uint32_t virtual_tile_in_original = shared_virtual_tile_id % virtual_tiles_per_original_tile;
+        const uint32_t pixel_local_x = base_pixel_x + pixel_offset_x;
+        const uint32_t pixel_local_y = base_pixel_y + pixel_offset_y;
         
-        const uint32_t original_tile_x = original_tile_id % tileGrid.x;
-        const uint32_t original_tile_y = original_tile_id / tileGrid.x;
-        
-        // 将virtual tile映射到pixels区域
-        // 32个virtual tiles按8x4方式排列在16x16 tile内，每个virtual tile = 2x4 pixels
-        const uint32_t virtual_tile_x = virtual_tile_in_original % 8;  // 0-7
-        const uint32_t virtual_tile_y = virtual_tile_in_original / 8;  // 0-3
-        
-        // 每个virtual tile对应2x4的pixels区域 (width=2, height=4)
-        const uint32_t base_pixel_x = virtual_tile_x * 2;  // 0,2,4,6,8,10,12,14
-        const uint32_t base_pixel_y = virtual_tile_y * 4;  // 0,4,8,12
-        
-        // Algorithm 3 line 11: 8个warps分别处理2x4区域内的8个pixels
-        const uint32_t warpId = threadIdx.x / 32;
-        const uint32_t laneId = threadIdx.x % 32;
-        
-        // 每个block处理1个virtual tile = 8个pixels，每个warp处理1个pixel
-        if (warpId < 8) { // 8 warps per block (保持与原始BlockSize一致)
-            // 在2x4区域内按行优先排列8个pixels
-            // warp 0-7 对应 pixels: (0,0),(1,0),(0,1),(1,1),(0,2),(1,2),(0,3),(1,3)
-            const uint32_t pixel_offset_x = warpId % 2;      // 0,1,0,1,0,1,0,1
-            const uint32_t pixel_offset_y = warpId / 2;      // 0,0,1,1,2,2,3,3
-            
-            const uint32_t pixel_local_x = base_pixel_x + pixel_offset_x;
-            const uint32_t pixel_local_y = base_pixel_y + pixel_offset_y;
-            
-            const tcnn::uvec2 pixel = {
-                original_tile_x * 16 + pixel_local_x,
-                original_tile_y * 16 + pixel_local_y
-            };
+        const tcnn::uvec2 pixel = {
+            original_tile_x * 16 + pixel_local_x,
+            original_tile_y * 16 + pixel_local_y
+        };
                 
-                if (pixel.x < params.resolution.x && pixel.y < params.resolution.y) {
-                    
-                    // Algorithm 3 line 12: Initialize local variables
-                    auto ray = initializeRayPerPixel<TGUTRenderer::TRayPayload>(
-                        params, pixel, sensorRayOriginPtr, sensorRayDirectionPtr, sensorToWorldTransform);
-                    
-                    // Algorithm 3 line 13-17: Warp-level parallel processing
-                    // 使用原始tile的粒子数据（16x16 tile的数据）
-                    const tcnn::uvec2 original_tile = {original_tile_x, original_tile_y};
-                    
-                    TGUTRenderer::evalFineGrainedWarp(params,
-                                                     ray,
-                                                     sortedTileRangeIndicesPtr,
-                                                     sortedTileDataPtr,
-                                                     particlesProjectedPositionPtr,
-                                                     particlesProjectedConicOpacityPtr,
-                                                     particlesGlobalDepthPtr,
-                                                     particlesPrecomputedFeaturesPtr,
-                                                     original_tile,
-                                                     tileGrid,
-                                                     laneId, // lane ID for warp-level processing
-                                                     {parameterMemoryHandles});
-                    
-                    // Algorithm 3 line 18: Write outputs
-                    finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, 
-                              worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
-                }
-        }
+        // Algorithm 3 line 12: Initialize local variables
+        auto ray = initializeRayPerPixel<TGUTRenderer::TRayPayload>(
+            params, pixel, sensorRayOriginPtr, sensorRayDirectionPtr, sensorToWorldTransform);
         
-        // 获取下一个virtual tile
-        if (threadIdx.x == 0) {
-            shared_virtual_tile_id = atomicAdd(nextVirtualTileCounterPtr, 1);
-        }
-        __syncthreads();
+        // Algorithm 3 line 13-17: Warp-level parallel processing
+        // 使用原始tile的粒子数据（16x16 tile的数据）
+        const tcnn::uvec2 original_tile = {original_tile_x, original_tile_y};
+        
+        TGUTRenderer::evalFineGrainedWarp(params,
+                                            ray,
+                                            sortedTileRangeIndicesPtr,
+                                            sortedTileDataPtr,
+                                            particlesProjectedPositionPtr,
+                                            particlesProjectedConicOpacityPtr,
+                                            particlesGlobalDepthPtr,
+                                            particlesPrecomputedFeaturesPtr,
+                                            original_tile,
+                                            tileGrid,
+                                            laneId, // lane ID for warp-level processing
+                                            {parameterMemoryHandles});
+        
+        // Algorithm 3 line 18: Write outputs
+        finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, 
+                    worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
     }
 }
+
 
 __global__ void render(threedgut::RenderParameters params,
                        const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
@@ -291,55 +208,64 @@ __global__ void render(threedgut::RenderParameters params,
     finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
 }
 
-// 反向渲染CUDA内核
-__global__ void renderBackward(threedgut::RenderParameters params,
-                               const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
-                               const uint32_t* __restrict__ sortedTileDataPtr,
-                               const tcnn::vec3* __restrict__ sensorRayOriginPtr,
-                               const tcnn::vec3* __restrict__ sensorRayDirectionPtr,
-                               tcnn::mat4x3 sensorToWorldTransform,
-                               const float* __restrict__ worldHitDistancePtr,
-                               const float* __restrict__ worldHitDistanceGradientPtr,
-                               const tcnn::vec4* __restrict__ radianceDensityPtr,
-                               const tcnn::vec4* __restrict__ radianceDensityGradientPtr,
-                               tcnn::vec3* __restrict__ /*worldRayOriginGradientPtr*/,
-                               tcnn::vec3* __restrict__ /*worldRayDirectionGradientPtr*/,
-                               const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
-                               const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
-                               const float* __restrict__ particlesGlobalDepthPtr,
-                               const float* __restrict__ particlesPrecomputedFeaturesPtr,
-                               const uint64_t* __restrict__ parameterMemoryHandles,
-                               tcnn::vec2* __restrict__ particlesProjectedPositionGradPtr,
-                               tcnn::vec4* __restrict__ particlesProjectedConicOpacityGradPtr,
-                               float* __restrict__ particlesGlobalDepthGradPtr,
-                               float* __restrict__ particlesPrecomputedFeaturesGradPtr,
-                               const uint64_t* __restrict__ parameterGradientMemoryHandles) {
+/**
+ * 🔄 反向传播渲染内核 - 从Forward结果计算所有参数梯度
+ * 
+ * 💡 核心流程: 加载Forward结果 → 初始化反向光线 → 遍历粒子计算梯度
+ * ⚠️  重要: 使用与Forward相同的粒子排序数据，但独立的执行配置
+ */
+__global__ void renderBackward(
+    // 基础参数
+    threedgut::RenderParameters params,
+    const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,      // Forward计算的tile粒子范围
+    const uint32_t* __restrict__ sortedTileDataPtr,                 // Forward计算的粒子排序索引
+    
+    // 光线几何
+    const tcnn::vec3* __restrict__ sensorRayOriginPtr,              // 光线起点
+    const tcnn::vec3* __restrict__ sensorRayDirectionPtr,           // 光线方向
+    tcnn::mat4x3 sensorToWorldTransform,                            // 坐标变换
+    
+    // Forward结果 + 损失梯度 (输入)
+    const float* __restrict__ worldHitDistancePtr,                  // Forward: 击中距离
+    const float* __restrict__ worldHitDistanceGradientPtr,          // ∂L/∂distance
+    const tcnn::vec4* __restrict__ radianceDensityPtr,              // Forward: 最终颜色+密度
+    const tcnn::vec4* __restrict__ radianceDensityGradientPtr,      // ∂L/∂color (主要输入)
+    
+    // 光线梯度 (暂未使用)
+    tcnn::vec3* __restrict__ /*worldRayOriginGradientPtr*/,
+    tcnn::vec3* __restrict__ /*worldRayDirectionGradientPtr*/,
+    
+    // 粒子数据 (Forward计算)
+    const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,   // 粒子屏幕位置
+    const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr, // 椭圆参数+透明度
+    const float* __restrict__ particlesGlobalDepthPtr,              // 粒子深度
+    const float* __restrict__ particlesPrecomputedFeaturesPtr,      // 粒子特征
+    const uint64_t* __restrict__ parameterMemoryHandles,            // 神经网络参数
+    
+    // 梯度输出
+    tcnn::vec2* __restrict__ particlesProjectedPositionGradPtr,     // ∂L/∂粒子位置
+    tcnn::vec4* __restrict__ particlesProjectedConicOpacityGradPtr, // ∂L/∂椭圆参数
+    float* __restrict__ particlesGlobalDepthGradPtr,                // ∂L/∂粒子深度
+    float* __restrict__ particlesPrecomputedFeaturesGradPtr,        // ∂L/∂粒子特征
+    const uint64_t* __restrict__ parameterGradientMemoryHandles     // ∂L/∂网络参数
+) {
 
-    auto ray = initializeBackwardRay<TGUTRenderer::TRayPayloadBackward>(params,
-                                                                        sensorRayOriginPtr,
-                                                                        sensorRayDirectionPtr,
-                                                                        worldHitDistancePtr,
-                                                                        worldHitDistanceGradientPtr,
-                                                                        radianceDensityPtr,
-                                                                        radianceDensityGradientPtr,
-                                                                        sensorToWorldTransform);
+    // 步骤1: 从Forward结果初始化反向光线
+    auto ray = initializeBackwardRay<TGUTRenderer::TRayPayloadBackward>(
+        params, sensorRayOriginPtr, sensorRayDirectionPtr,
+        worldHitDistancePtr, worldHitDistanceGradientPtr,
+        radianceDensityPtr, radianceDensityGradientPtr, sensorToWorldTransform);
 
-    // TGUTModel::evalBackward(params, ray, {parameterMemoryHandles}, {parameterGradientMemoryHandles});
-
-    TGUTBackwardRenderer::eval(params,
-                               ray,
-                               sortedTileRangeIndicesPtr,
-                               sortedTileDataPtr,
-                               particlesProjectedPositionPtr,
-                               particlesProjectedConicOpacityPtr,
-                               particlesGlobalDepthPtr,
-                               particlesPrecomputedFeaturesPtr,
-                               {parameterMemoryHandles},
-                                particlesProjectedPositionGradPtr,
-                                particlesProjectedConicOpacityGradPtr,
-                                 particlesGlobalDepthGradPtr,
-                                particlesPrecomputedFeaturesGradPtr,
-                              {parameterGradientMemoryHandles});
+    // 步骤2: 使用链式法则计算所有参数梯度
+    TGUTBackwardRenderer::eval(
+        params, ray,
+        sortedTileRangeIndicesPtr, sortedTileDataPtr,
+        particlesProjectedPositionPtr, particlesProjectedConicOpacityPtr,
+        particlesGlobalDepthPtr, particlesPrecomputedFeaturesPtr,
+        {parameterMemoryHandles},
+        particlesProjectedPositionGradPtr, particlesProjectedConicOpacityGradPtr,
+        particlesGlobalDepthGradPtr, particlesPrecomputedFeaturesGradPtr,
+        {parameterGradientMemoryHandles});
 }
 
 // 反向投影CUDA内核

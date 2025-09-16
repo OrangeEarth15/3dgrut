@@ -129,9 +129,6 @@ struct GUTRenderer::GutRenderForwardContext {
         particlesGlobalDepthGradient.clear(processQueueHandle, logger);
         particlesPrecomputedFeaturesGradient.clear(processQueueHandle, logger);
         scanningWorkingBuffer.clear(processQueueHandle, logger);
-#if DYNAMIC_LOAD_BALANCING || FINE_GRAINED_LOAD_BALANCING
-        nextTileCounter.clear(processQueueHandle, logger);
-#endif
     }
 
     CudaBuffer unsortedTileDepthKeys; // 未排序的tile深度键
@@ -183,10 +180,6 @@ struct GUTRenderer::GutRenderForwardContext {
     mutable CudaBuffer particlesGlobalDepthGradient;           ///< particles global depth
     mutable CudaBuffer particlesPrecomputedFeaturesGradient;   ///< precomputed particle features float [NxFeaturesDim]
     CudaBuffer scanningWorkingBuffer;                          ///< working buffer to compute the cumulative sum of particles/tiles intersections number
-    
-#if DYNAMIC_LOAD_BALANCING || FINE_GRAINED_LOAD_BALANCING
-    CudaBuffer nextTileCounter;                                    ///< atomic counter for dynamic load balancing tile assignment
-#endif
 
     inline Status updateParticlesWorkingBuffers(int numParticles, cudaStream_t cudaStream, const Logger& logger) {
         const bool uptodate = particlesTilesCount.size() >= numParticles * sizeof(uint32_t);
@@ -400,50 +393,24 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
     {
         const auto renderProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render::render"};
         
-#if DYNAMIC_LOAD_BALANCING || FINE_GRAINED_LOAD_BALANCING
-        // 初始化动态负载均衡的计数器
-        const uint64_t queueHandle = reinterpret_cast<uint64_t>(cudaStream);
-        CHECK_STATUS_RETURN(m_forwardContext->nextTileCounter.resize(sizeof(uint32_t), queueHandle, m_logger));
-        
-        // 添加调试信息
-        // LOG_INFO(m_logger, "Dynamic load balancing: nextTileCounter allocated at %p, size %zu", 
-        //          m_forwardContext->nextTileCounter.data(), m_forwardContext->nextTileCounter.size());
-        
-        uint32_t initialValue = 0;
-        CUDA_CHECK_RETURN(cudaMemcpyAsync(m_forwardContext->nextTileCounter.data(), &initialValue, sizeof(uint32_t), cudaMemcpyHostToDevice, cudaStream), m_logger);
-        
-        // 同步确保初始化完成
-        CUDA_CHECK_RETURN(cudaStreamSynchronize(cudaStream), m_logger);
-        // LOG_INFO(m_logger, "nextTileCounter initialized successfully");
-#endif
-        
         // 简单直接的CUDA事件计时
         cudaEvent_t startEvent, stopEvent;
         cudaEventCreate(&startEvent);
         cudaEventCreate(&stopEvent);
         cudaEventRecord(startEvent, cudaStream);
         
-        // 根据配置选择不同的负载均衡策略
 #if FINE_GRAINED_LOAD_BALANCING
-        // Fine-grained load balancing enabled
-        // Algorithm 3 line 21-27: Fine-grained launch configuration
+        // 🚀 Static Fine-grained load balancing
+        // 静态分配：每个block处理一个virtual tile (4个pixels)
         
-        // 计算virtual tiles总数 (每个原始tile产生32个virtual tiles)
-        const uint32_t virtual_tiles_per_original_tile = 32; // (16*16) / 8
+        // 计算virtual tiles总数 (每个原始tile产生64个virtual tiles)
+        const uint32_t virtual_tiles_per_original_tile = 64; // (16*16) / 4  
         const uint32_t virtual_tiles_total = tileGrid.x * tileGrid.y * virtual_tiles_per_original_tile;
         
-        // 计算最大硬件资源 (Algorithm 3 line 25)
-        int smCount;
-        cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, 0);
-        const uint32_t max_hw_resource = smCount * 16; // 16 blocks per SM
+        LOG_INFO(m_logger, "Static Fine-grained load balancing: virtualTiles=%u, numBlocks=%u, threadsPerBlock=128", 
+                    virtual_tiles_total, virtual_tiles_total);
         
-        // Algorithm 3 line 26: Launch with maximum hardware resource
-        const uint32_t numBlocks = min(max_hw_resource, virtual_tiles_total);
-        
-        LOG_INFO(m_logger, "Fine-grained load balancing: virtualTiles=%u, numBlocks=%u, threadsPerBlock=256", 
-                    virtual_tiles_total, numBlocks);
-        
-        ::renderFineGrainBalanced<<<numBlocks, 256, 0, cudaStream>>>( // 256 threads = 8 warps * 32 threads
+        ::renderFineGrainBalanced<<<virtual_tiles_total, 128, 0, cudaStream>>>( // 128 threads = 4 warps * 32 threads
             params,
             (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
             (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
@@ -458,27 +425,11 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             (const float*)m_forwardContext->particlesGlobalDepth.data(),
             (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
             parameters.m_dptrParametersBuffer,
-            (uint32_t*)m_forwardContext->nextTileCounter.data(),
             tcnn::uvec2{tileGrid.x, tileGrid.y}
         );
-            
-#else
-        // Fine-grained load balancing disabled, use dynamic or static
-#if DYNAMIC_LOAD_BALANCING
-            // 动态负载均衡：优化为完整waves避免tail effect (H200: 660 blocks/wave)
-            const uint32_t numBlocksX = min(tileGrid.x, 66u);  // 66×60=3960 blocks = 6×660 (6完整waves)
-            const uint32_t numBlocksY = min(tileGrid.y, 60u);
-            
-            // 批量动态负载均衡: tileGrid(195, 130), blocks(66, 60)
-            // LOG_INFO(m_logger, "Dynamic load balancing launch: tileGrid(%u, %u), blocks(%u, %u), threads(%u, %u)", 
-            //          tileGrid.x, tileGrid.y, numBlocksX, numBlocksY, 
-            //          GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY);
-            // LOG_INFO(m_logger, "nextTileCounter pointer: %p", (uint32_t*)m_forwardContext->nextTileCounter.data());
-            
-            ::renderDynamic<<<dim3{numBlocksX, numBlocksY, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
+
 #else
             ::render<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
-#endif
                 params, // threedgut::RenderParameters params
                 (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
                 (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
@@ -493,11 +444,6 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                 (const float*)m_forwardContext->particlesGlobalDepth.data(),
                 (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
                 parameters.m_dptrParametersBuffer
-#if DYNAMIC_LOAD_BALANCING
-                ,
-                (uint32_t*)m_forwardContext->nextTileCounter.data(),
-                tcnn::uvec2{tileGrid.x, tileGrid.y}
-#endif
             );
 #endif
         
@@ -564,29 +510,54 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
 
     {
         const auto renderProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render-backward::render"};
-        ::renderBackward<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
-            params,
-            (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
-            (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
-            (const tcnn::vec3*)sensorRayOriginCudaPtr,
-            (const tcnn::vec3*)sensorRayDirectionCudaPtr,
-            sensorPoseToMat(sensorPoseInv),
-            (const float*)worldHitDistanceCudaPtr,             //
-            (const float*)worldHitDistanceGradientCudaPtr,     // TODO: not implemented yet
-            (const tcnn::vec4*)radianceDensityCudaPtr,         //
-            (const tcnn::vec4*)radianceDensityGradientCudaPtr, // TODO: not implemented yet
-            (tcnn::vec3*)worldRayOriginGradientCudaPtr,        // TODO: not implemented yet
-            (tcnn::vec3*)worldRayDirectionGradientCudaPtr,     // TODO: not implemented yet
-            (const tcnn::vec2*)m_forwardContext->particlesProjectedPosition.data(),
-            (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(),
-            (const float*)m_forwardContext->particlesGlobalDepth.data(),
-            (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
-            parameters.m_dptrParametersBuffer,
-            (tcnn::vec2*)m_forwardContext->particlesProjectedPositionGradient.data(),
-            (tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacityGradient.data(),
-            (float*)m_forwardContext->particlesGlobalDepthGradient.data(),
-            (float*)m_forwardContext->particlesPrecomputedFeaturesGradient.data(),
-            parameters.m_dptrGradientsBuffer);
+        // ========== 反向传播渲染内核启动 ==========
+        // 🔑 注意：Backward始终使用原始16x16 tile配置，与Forward的fine-grained优化无关
+        ::renderBackward<<<
+            dim3{tileGrid.x, tileGrid.y, 1u},                    // Grid: 每个原始tile一个block (不是virtual tile!)
+            dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, // Block: 16×16=256 threads/block
+            0,                                                    // 无shared memory
+            cudaStream                                            // CUDA流
+        >>>(
+            // ========== 基础参数 ==========
+            params,                                               // 渲染参数：分辨率、传感器模型等
+            
+            // ========== Forward计算的粒子组织数据（只读） ==========
+            (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(), // 每个tile中粒子的索引范围[start,end)
+            (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),     // 按(tile,depth)排序的粒子索引数组
+            
+            // ========== 传感器和光线数据（只读） ==========
+            (const tcnn::vec3*)sensorRayOriginCudaPtr,            // 每像素光线起点 [W×H×3]
+            (const tcnn::vec3*)sensorRayDirectionCudaPtr,         // 每像素光线方向 [W×H×3] (归一化)
+            sensorPoseToMat(sensorPoseInv),                       // 传感器到世界坐标变换矩阵 4×3
+            
+            // ========== Forward输出 + 损失梯度输入 ==========
+            (const float*)worldHitDistanceCudaPtr,               // Forward输出：每像素击中距离 [W×H×1]
+            (const float*)worldHitDistanceGradientCudaPtr,       // 损失对击中距离的梯度 [W×H×1] (TODO: 未实现)
+            (const tcnn::vec4*)radianceDensityCudaPtr,           // Forward输出：每像素辐射+密度 [W×H×4]
+            (const tcnn::vec4*)radianceDensityGradientCudaPtr,   // 损失对辐射的梯度 [W×H×4] (TODO: 未实现)
+            
+            // ========== 光线梯度输出（暂未使用） ==========
+            (tcnn::vec3*)worldRayOriginGradientCudaPtr,          // 输出：损失对光线起点的梯度 [W×H×3] (TODO: 未实现)
+            (tcnn::vec3*)worldRayDirectionGradientCudaPtr,       // 输出：损失对光线方向的梯度 [W×H×3] (TODO: 未实现)
+            
+            // ========== Forward计算的粒子投影数据（只读） ==========
+            (const tcnn::vec2*)m_forwardContext->particlesProjectedPosition.data(),     // 粒子投影中心位置 [N×2]
+            (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(), // 粒子投影椭圆参数+不透明度 [N×4]
+            (const float*)m_forwardContext->particlesGlobalDepth.data(),                // 粒子全局深度值 [N×1]
+            (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),       // 粒子预计算特征(RGB等) [N×FeaturesDim]
+            
+            // ========== 可训练参数（只读） ==========
+            parameters.m_dptrParametersBuffer,                   // GPU上的神经网络参数(只读)
+            
+            // ========== 粒子投影参数的梯度输出 ==========
+            (tcnn::vec2*)m_forwardContext->particlesProjectedPositionGradient.data(),     // 输出：位置梯度 [N×2]
+            (tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacityGradient.data(), // 输出：椭圆+透明度梯度 [N×4]  
+            (float*)m_forwardContext->particlesGlobalDepthGradient.data(),                // 输出：深度梯度 [N×1]
+            (float*)m_forwardContext->particlesPrecomputedFeaturesGradient.data(),       // 输出：特征梯度 [N×FeaturesDim]
+            
+            // ========== 神经网络参数梯度缓冲区 ==========
+            parameters.m_dptrGradientsBuffer                     // 输出：神经网络参数梯度
+        );
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }
 

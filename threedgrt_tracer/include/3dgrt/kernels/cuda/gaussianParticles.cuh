@@ -87,55 +87,109 @@ static inline __device__ void addSphCoeffGrd(float3* sphCoefficientsGrad, int id
     atomicAdd(&sphCoefficientsGrad[idx].z, val.z);
 }
 
+/**
+ * 球谐函数反向传播函数 - 计算球谐系数的梯度
+ * 
+ * 🎯 球谐函数基础知识:
+ * 球谐函数(Spherical Harmonics)是定义在球面上的正交函数基，可以高效表示方向相关的函数。
+ * 在3D渲染中，用于表示环境光照和粒子的方向相关颜色特性。
+ * 
+ * 🔢 数学公式:
+ * RGB(direction) = Σ(coefficient_i × Y_i(θ, φ))
+ * 其中 Y_i 是第i个球谐基函数，coefficient_i 是对应系数
+ * 
+ * 🎨 实际应用:
+ * - degree 0: 环境光 (1个系数) - 常数项，各向同性
+ * - degree 1: 线性光照 (3个系数) - 主要光源方向
+ * - degree 2: 二次光照 (5个系数) - 复杂光照效果
+ * - degree 3: 三次光照 (7个系数) - 更精细的光照细节
+ */
 static inline __device__ float3 radianceFromSpHBwd(
-    int deg, const float3* sphCoefficients, const float3& rdir, float weight, const float3& rayRadGrd, float3* sphCoefficientsGrad) {
-    // radiance unclamped
+    int deg,                           // 球谐函数的最高度数 (0-3)
+    const float3* sphCoefficients,     // 球谐系数数组 (每个float3对应RGB三通道)
+    const float3& rdir,                // 观察方向 (标准化的3D向量)
+    float weight,                      // 权重系数 (来自体积渲染的alpha*transmittance)
+    const float3& rayRadGrd,           // 从后续计算传来的辐射度梯度 ∂L/∂radiance
+    float3* sphCoefficientsGrad        // 输出: 球谐系数的梯度累积数组
+) {
+    // =============== 步骤1: 前向传播重现 ===============
+    // 🔄 重新计算前向传播的结果，获得未裁剪的原始辐射度
+    // 命名结构其实是gaussian_radianc_unclamped
     const float3 gradu = radianceFromSpH(deg, sphCoefficients, rdir, false);
 
-    // clamped radiance
+    // =============== 步骤2: clamp裁剪操作 ===============  
+    // 🎯 物理含义: 确保辐射度为非负值 (光不能是负的)
+    // 📐 数学含义: ReLU函数 f(x) = max(0, x)
     float3 grad = make_float3(gradu.x > 0.0f ? gradu.x : 0.0f,
                               gradu.y > 0.0f ? gradu.y : 0.0f,
                               gradu.z > 0.0f ? gradu.z : 0.0f);
 
-    //
-    float3 dL_dRGB = rayRadGrd * weight;
-    dL_dRGB.x *= (gradu.x > 0.0f ? 1 : 0);
-    dL_dRGB.y *= (gradu.y > 0.0f ? 1 : 0);
-    dL_dRGB.z *= (gradu.z > 0.0f ? 1 : 0);
+    // =============== 步骤3: 梯度预处理 ===============
+    // 🔗 链式法则第一步: 考虑权重和ReLU的梯度
+    // dL/dRadiance_raw = dL/dRadiance_final × weight × ReLU'(x)
+    // 其中 ReLU'(x) = 1 if x > 0, else 0
+    float3 dL_dRGB = rayRadGrd * weight;        // 权重缩放
+    dL_dRGB.x *= (gradu.x > 0.0f ? 1 : 0);     // clamp梯度 (x通道)
+    dL_dRGB.y *= (gradu.y > 0.0f ? 1 : 0);     // clamp梯度 (y通道) 
+    dL_dRGB.z *= (gradu.z > 0.0f ? 1 : 0);     // clamp梯度 (z通道)
 
-    // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    // ---> rayRad = weight * grad = weight * explu(gsph0 * SH_C0 +
-    // 0.5,SHRadMinBound) with explu(x,a) = x if x > a else a*e(x-a)
-    // ===> d_rayRad / d_gsph0 =   weight * SH_C0
+    // =============== 步骤4: Degree 0 - 环境光系数的梯度 ===============
+    // 🌍 物理含义: 球谐函数的第0项是常数项，表示各向同性的环境光
+    // 📐 数学公式: Y_0^0 = SH_C0 (常数 ≈ 0.28209)
+    // 
+    // 🔗 链式法则推导:
+    // RGB = coefficient_0 × SH_C0 + 其他项...
+    // ∂RGB/∂coefficient_0 = SH_C0
+    // ∂L/∂coefficient_0 = ∂L/∂RGB × ∂RGB/∂coefficient_0 = dL_dRGB × SH_C0
     addSphCoeffGrd(sphCoefficientsGrad, 0, SH_C0 * dL_dRGB);
 
     if (deg > 0) {
-        // const float3 sphdiru = gpos - rori;
-        // const float3 sphdir = safe_normalize(sphdiru);
-        const float3& sphdir = rdir;
+        // =============== 步骤5: Degree 1 - 线性光照系数的梯度 ===============
+        // 🎯 物理含义: 线性项描述主要光源的方向性，类似于兰伯特光照
+        // 📐 数学基础: degree 1 有3个基函数，对应 x, y, z 方向的线性分量
+        
+        const float3& sphdir = rdir;  // 观察方向 (已标准化)
+        
+        // 提取方向分量 (球坐标系中的单位向量)
+        float x = sphdir.x;  // X方向分量
+        float y = sphdir.y;  // Y方向分量  
+        float z = sphdir.z;  // Z方向分量
 
-        float x = sphdir.x;
-        float y = sphdir.y;
-        float z = sphdir.z;
+        // 🔗 Degree 1 球谐基函数的导数计算:
+        // Y_1^{-1} = SH_C1 × y     =>  ∂RGB/∂coeff_1 = -SH_C1 × y
+        // Y_1^0    = SH_C1 × z     =>  ∂RGB/∂coeff_2 = SH_C1 × z  
+        // Y_1^1    = SH_C1 × x     =>  ∂RGB/∂coeff_3 = -SH_C1 × x
+        float dRGBdsh1 = -SH_C1 * y;  // 对系数1的偏导数
+        float dRGBdsh2 = SH_C1 * z;   // 对系数2的偏导数
+        float dRGBdsh3 = -SH_C1 * x;  // 对系数3的偏导数
 
-        float dRGBdsh1 = -SH_C1 * y;
-        float dRGBdsh2 = SH_C1 * z;
-        float dRGBdsh3 = -SH_C1 * x;
-
+        // 应用链式法则: ∂L/∂coefficient = ∂L/∂RGB × ∂RGB/∂coefficient
         addSphCoeffGrd(sphCoefficientsGrad, 1, dRGBdsh1 * dL_dRGB);
         addSphCoeffGrd(sphCoefficientsGrad, 2, dRGBdsh2 * dL_dRGB);
         addSphCoeffGrd(sphCoefficientsGrad, 3, dRGBdsh3 * dL_dRGB);
 
         if (deg > 1) {
-            float xx = x * x, yy = y * y, zz = z * z;
-            float xy = x * y, yz = y * z, xz = x * z;
+            // =============== 步骤6: Degree 2 - 二次光照系数的梯度 ===============
+            // 🎯 物理含义: 二次项捕获更复杂的光照效果，如边缘光、反射等
+            // 📐 数学基础: degree 2 有5个基函数，涉及二次项组合
+            
+            // 预计算二次项 (优化性能)
+            float xx = x * x, yy = y * y, zz = z * z;  // 平方项
+            float xy = x * y, yz = y * z, xz = x * z;  // 交叉项
 
-            float dRGBdsh4 = SH_C2[0] * xy;
-            float dRGBdsh5 = SH_C2[1] * yz;
-            float dRGBdsh6 = SH_C2[2] * (2.f * zz - xx - yy);
-            float dRGBdsh7 = SH_C2[3] * xz;
-            float dRGBdsh8 = SH_C2[4] * (xx - yy);
+            // 🔗 Degree 2 球谐基函数的导数:
+            // Y_2^{-2} ∝ xy           =>  ∂RGB/∂coeff_4 = SH_C2[0] × xy
+            // Y_2^{-1} ∝ yz           =>  ∂RGB/∂coeff_5 = SH_C2[1] × yz
+            // Y_2^0    ∝ (3z²-1)      =>  ∂RGB/∂coeff_6 = SH_C2[2] × (2z²-x²-y²)
+            // Y_2^1    ∝ xz           =>  ∂RGB/∂coeff_7 = SH_C2[3] × xz  
+            // Y_2^2    ∝ (x²-y²)      =>  ∂RGB/∂coeff_8 = SH_C2[4] × (x²-y²)
+            float dRGBdsh4 = SH_C2[0] * xy;                    // xy项的梯度
+            float dRGBdsh5 = SH_C2[1] * yz;                    // yz项的梯度
+            float dRGBdsh6 = SH_C2[2] * (2.f * zz - xx - yy);  // z主导项的梯度
+            float dRGBdsh7 = SH_C2[3] * xz;                    // xz项的梯度
+            float dRGBdsh8 = SH_C2[4] * (xx - yy);             // x-y差项的梯度
 
+            // 累积梯度到对应的球谐系数
             addSphCoeffGrd(sphCoefficientsGrad, 4, dRGBdsh4 * dL_dRGB);
             addSphCoeffGrd(sphCoefficientsGrad, 5, dRGBdsh5 * dL_dRGB);
             addSphCoeffGrd(sphCoefficientsGrad, 6, dRGBdsh6 * dL_dRGB);
@@ -143,14 +197,22 @@ static inline __device__ float3 radianceFromSpHBwd(
             addSphCoeffGrd(sphCoefficientsGrad, 8, dRGBdsh8 * dL_dRGB);
 
             if (deg > 2) {
-                float dRGBdsh9  = SH_C3[0] * y * (3.f * xx - yy);
-                float dRGBdsh10 = SH_C3[1] * xy * z;
-                float dRGBdsh11 = SH_C3[2] * y * (4.f * zz - xx - yy);
-                float dRGBdsh12 = SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy);
-                float dRGBdsh13 = SH_C3[4] * x * (4.f * zz - xx - yy);
-                float dRGBdsh14 = SH_C3[5] * z * (xx - yy);
-                float dRGBdsh15 = SH_C3[6] * x * (xx - 3.f * yy);
+                // =============== 步骤7: Degree 3 - 三次光照系数的梯度 ===============
+                // 🎯 物理含义: 三次项提供最精细的光照细节和高频特征
+                // 📐 数学基础: degree 3 有7个基函数，涉及三次项组合
+                // 🎨 应用场景: 高质量渲染中的精细光照效果
+                
+                // 🔗 Degree 3 球谐基函数的导数 (复杂的三次多项式):
+                // 每个公式都是对应球谐基函数对方向向量的偏导数
+                float dRGBdsh9  = SH_C3[0] * y * (3.f * xx - yy);          // Y_3^{-3}: y(3x²-y²)
+                float dRGBdsh10 = SH_C3[1] * xy * z;                        // Y_3^{-2}: xyz
+                float dRGBdsh11 = SH_C3[2] * y * (4.f * zz - xx - yy);      // Y_3^{-1}: y(4z²-x²-y²)
+                float dRGBdsh12 = SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy); // Y_3^0: z(2z²-3x²-3y²)
+                float dRGBdsh13 = SH_C3[4] * x * (4.f * zz - xx - yy);      // Y_3^1: x(4z²-x²-y²)
+                float dRGBdsh14 = SH_C3[5] * z * (xx - yy);                 // Y_3^2: z(x²-y²)
+                float dRGBdsh15 = SH_C3[6] * x * (xx - 3.f * yy);          // Y_3^3: x(x²-3y²)
 
+                // 🔗 链式法则: 将每个偏导数与损失梯度相乘并累积
                 addSphCoeffGrd(sphCoefficientsGrad, 9, dRGBdsh9 * dL_dRGB);
                 addSphCoeffGrd(sphCoefficientsGrad, 10, dRGBdsh10 * dL_dRGB);
                 addSphCoeffGrd(sphCoefficientsGrad, 11, dRGBdsh11 * dL_dRGB);
@@ -162,6 +224,9 @@ static inline __device__ float3 radianceFromSpHBwd(
         }
     }
 
+    // =============== 步骤8: 返回裁剪后的辐射度值 ===============
+    // 🎯 返回值含义: 经过ReLU裁剪的最终辐射度，用于后续的体积渲染计算
+    // 📊 用途: 这个值会与权重相乘，贡献到最终的像素颜色
     return grad;
 }
 

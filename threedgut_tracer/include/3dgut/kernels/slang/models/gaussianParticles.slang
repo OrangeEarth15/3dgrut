@@ -635,24 +635,41 @@ float integrateHit<let backToFront : bool>(
 }
 
 /**
- * 处理射线与高斯粒子相交的完整流程 - 带模板参数的高效实现
+ * 📋 DENSITY反向传播调用链（第4层/4层）- 高斯几何相交的数学实现
  * 
- * 【核心功能】：
- * 这是渲染管线中的关键函数，完成射线-粒子相交的完整处理：
- * 1. 检测相交 (调用 hit 函数)
- * 2. 计算贡献 (调用 integrateHit 函数)
- * 3. 支持双向混合模式 (通过 let 模板参数优化)
+ * 🔄 调用路径（到达最终数学层）：
+ * 1. 上3层：gutKBufferRenderer.cuh:205 → shRadiativeGaussianParticles.cuh:437 → gaussianParticles.slang:1121
+ * 2. 【当前层】gaussianParticles.slang:673 → hit() + integrateHit<backToFront>()
  * 
- * 【let 模板参数的重要性】：
- * <let backToFront : bool> 是编译时常量，允许编译器生成两个不同的优化版本：
- * - backToFront=true:  从后往前的混合 (深度排序渲染)
- * - backToFront=false: 从前往后的混合 (标准alpha混合)
+ * 🎯 本层职责：高斯椭球几何计算的完整实现
+ * - 射线-椭球相交测试：完整的3D几何数学计算
+ * - 坐标变换链：世界坐标→粒子坐标→标准化坐标
+ * - 高斯核函数：计算粒子对光线的响应强度
+ * - 体积积分：透射率和深度的数值积分
  * 
- * 【渲染模式对比】：
- * 前向后渲染: color = color * (1-alpha) + particle_color * alpha
- * 后向前渲染: color = particle_color * alpha + color * (1-alpha)
- * 数学等价但在数值精度和GPU优化上有差异
+ * 🧮 几何数学核心算法：
+ * 1. 坐标变换：P_norm = Scale^(-1) × Rotation^(-1) × (P_world - Position)
+ * 2. 距离计算：d = |cross(ray_dir, ray_pos)| （点到直线距离）
+ * 3. 高斯响应：α = min(0.99, exp(-0.5×d²) × density)
+ * 4. 体积积分：T_new = T_old × (1-α), depth_new = depth_old + α×hit_depth
  * 
+ * 🔍 反向传播中的梯度计算：
+ * ∂L/∂α → ∂α/∂(位置,旋转,缩放,密度) 的完整链式法则应用
+ * - ∂α/∂位置：通过距离计算的坐标变换梯度  
+ * - ∂α/∂旋转：通过旋转矩阵对四元数的导数
+ * - ∂α/∂缩放：通过椭球变换的缩放导数
+ * - ∂α/∂密度：高斯响应函数的直接导数
+ * 
+ * 🚀 Slang自动微分特性：
+ * - [BackwardDifferentiable] 支持编译器自动生成反向版本
+ * - let模板参数：编译时优化，生成专用版本（前向后/后向前）
+ * - 自动梯度管理：无需手动实现复杂的几何导数
+ * 
+ * ⚡ 渲染模式支持：
+ * - backToFront=false: 前向后混合 (标准K-Buffer)
+ * - backToFront=true:  后向前混合 (深度排序)
+ * - 编译时分支：零运行时开销的模式切换
+ *
  * 【函数工作流程】：
  * Step 1: 从缓冲区获取粒子参数 (fetchParameters)
  * Step 2: 执行射线-椭球相交测试 (hit)
@@ -680,27 +697,36 @@ float processHitFromBuffer<let backToFront : bool>(
     no_diff bool enableNormal,
     inout float3 integratedNormal)
 {
-    // 初始化局部变量，用于接收相交测试结果
+    // ========== 步骤1：初始化输出变量 ==========
     float alpha = 0.0f;    // 粒子不透明度 (输出)
     float depth;           // 相交距离 (输出)  
     float3 normal;         // 表面法线 (输出)
     
-    // 🎯 核心步骤：执行射线-高斯椭球相交测试
-    // hit() 函数包含了完整的几何计算：
-    // 1. 坐标变换 (世界空间 → 粒子局部空间 → 标准化空间)
-    // 2. 距离计算 (canonicalRayMinSquaredDistance)
-    // 3. 核函数响应 (canonicalRayMaxKernelResponse)  
-    // 4. alpha值计算和阈值检查
-    if (hit(rayOrigin,                                          // 射线起点
-            rayDirection,                                       // 射线方向
-            fetchParameters(particleIdx, parametersBuffer),    // 从缓冲区获取粒子参数
+    // ========== 步骤2：射线-高斯椭球相交测试 ==========
+    // 🎯 关键函数：hit() 包含完整的高斯几何数学计算
+    // 内部算法：
+    // 1. fetchParameters()：从缓冲区获取粒子的几何参数（位置,旋转,缩放,密度）
+    // 2. 坐标变换链：世界空间 → 粒子局部空间 → 标准化椭球空间
+    // 3. 点到直线距离：d = |cross(ray_dir, ray_pos_relative)|
+    // 4. 高斯核函数：response = exp(-0.5×d²)
+    // 5. alpha计算：α = min(0.99, response × density)
+    // 6. 早期剔除：如果α太小则直接返回false
+    if (hit(rayOrigin,                                          // 射线起点（世界坐标）
+            rayDirection,                                       // 射线方向（世界坐标）
+            fetchParameters(particleIdx, parametersBuffer),    // 粒子几何参数结构
             alpha,                                             // [输出] 计算得到的不透明度
             depth,                                             // [输出] 击中距离
             enableNormal,                                      // 是否需要计算法线
             normal))                                           // [输出] 表面法线
     {
-        // ✅ 相交成功！调用混合函数处理贡献
-        // 🚀 这里使用了 let 模板参数 <backToFront>，编译器会生成优化的特化版本
+        // ========== 步骤3：体积积分处理 ==========
+        // ✅ 相交成功！调用积分函数处理透射率和深度累积
+        // 🚀 integrateHit<backToFront>() 实现体积渲染的数学积分
+        // 核心公式：
+        // - 透射率：T_new = T_old × (1-α) 
+        // - 深度：depth_new = depth_old + α × hit_depth
+        // - 法线：normal_new = normal_old + α × hit_normal
+        // - 返回权重：weight = α × T_old （用于颜色混合）
         return integrateHit<backToFront>(alpha,           // 当前粒子的不透明度
                                          transmittance,   // [输入输出] 射线剩余透射率
                                          depth,           // 击中距离，用于深度积分
@@ -710,7 +736,8 @@ float processHitFromBuffer<let backToFront : bool>(
                                          integratedNormal); // [输入输出] 累积法线
     }
     
-    // ❌ 无相交，返回零权重
+    // ========== 步骤4：无相交的默认情况 ==========
+    // ❌ 射线未与椭球相交，返回零权重（粒子无贡献）
     return 0.0f;
 }
 
@@ -1010,38 +1037,44 @@ inline float particleDensityProcessHitFwdFromBuffer(
 }
 
 /**
- * 高斯粒子碰撞处理的反向传播函数 - 自动微分系统的核心
+ * 📋 DENSITY反向传播调用链（第3层/4层）- Slang自动微分核心
  *
- * 【核心功能】：
- * 这是体积渲染中最重要的反向传播函数，负责计算所有参与渲染的参数梯度。
- * 实现了复杂的链式法则计算，将输出梯度反向传播到粒子参数。
+ * 🔄 调用路径：
+ * 1. 上层：gutKBufferRenderer.cuh:205 → particles.densityProcessHitBwdToBuffer<false>()
+ * 2. 上层：shRadiativeGaussianParticles.cuh:437 → particleDensityProcessHitBwdToBuffer()
+ * 3. 【当前层】gaussianParticles.slang:1063 → bwd_diff(gaussianParticle.processHitFromBuffer<false>)()
+ * 4. 下层：gaussianParticles.slang:内部实现 → 高斯几何变换的完整梯度计算
  *
- * 【数学原理 - 体积渲染的反向模式】：
+ * 🎯 本层职责：体积渲染反向传播的数学核心
+ * - 状态恢复：从积分结果逆推积分前状态（逆向工程）
+ * - 微分对象创建：使用DifferentialPair封装值和梯度
+ * - 自动微分调用：触发Slang编译器生成的反向函数
+ * - 梯度自动更新：直接写入全局参数梯度缓冲区
+ *
+ * 🧮 体积渲染的反向模式数学原理：
  * 前向积分公式：
- *   transmittance_new = transmittance_old * (1 - alpha)
- *   depth_new = depth_old + alpha * hit_depth
- *   normal_new = normal_old + alpha * hit_normal
+ *   transmittance_new = transmittance_old × (1 - α)
+ *   depth_new = depth_old + α × hit_depth  
+ *   normal_new = normal_old + α × hit_normal
  *
- * 反向传播：使用链式法则恢复状态并计算梯度
- *   weight = 1.0 / (1 - alpha)  // 反向权重
- *   transmittance = transmittance_new * weight  // 恢复原始透射率
- *   depth = (depth_new - alpha * hit_depth) * weight  // 恢复原始深度
+ * 反向传播（链式法则 + 状态恢复）：
+ *   weight = 1.0 / (1 - α)  // 反向权重
+ *   transmittance_old = transmittance_new × weight  // 恢复原始透射率
+ *   depth_old = (depth_new - α × hit_depth) × weight  // 恢复原始深度
  *
- * 【工作流程】：
- * 1. 🔄 状态恢复：将前向积分的结果逆向恢复到积分前状态
- * 2. 📦 梯度包装：将值和梯度包装为 DifferentialPair 对象
- * 3. 🧠 自动微分：调用 bwd_diff() 引擎计算参数梯度
- * 4. 📤 梯度提取：从 DifferentialPair 中提取计算得到的梯度
+ * 🔍 梯度计算链条：
+ * ∂L/∂(几何参数) = ∂L/∂α × ∂α/∂(几何参数)
+ * 其中 ∂α/∂(几何参数) 涉及复杂的高斯核函数导数计算：
+ * - ∂α/∂位置：坐标变换链的导数
+ * - ∂α/∂旋转：四元数到矩阵的导数
+ * - ∂α/∂缩放：椭球变换的导数
+ * - ∂α/∂密度：高斯响应函数的导数
  *
- * 【关键技术 - DifferentialPair】：
- * Slang的双数（Dual Number）实现，每个值都携带其梯度：
- *   DifferentialPair<T> = { value: T, differential: T }
- * 支持自动跟踪整个计算图的梯度流。
- *
- * 【应用场景】：
- * - 🎓 神经辐射场训练：优化高斯粒子的位置、旋转、缩放
- * - 🎨 可微渲染：实现基于梯度的场景重建
- * - 🔧 参数优化：端到端训练整个渲染管线
+ * 🚀 Slang自动微分技术：
+ * - DifferentialPair<T>：双数实现，同时跟踪值和梯度
+ * - bwd_diff()：编译器自动生成的反向函数
+ * - 梯度自动传播：无需手工实现复杂的链式法则计算
+ * - 原子更新：多线程安全的梯度累积
  *
  * @param rayOrigin             射线起点 (世界坐标，不参与微分)
  * @param rayDirection          射线方向 (世界坐标，不参与微分)  
@@ -1081,43 +1114,49 @@ void particleDensityProcessHitBwdToBuffer(
 {
     if (alpha > 0.0f)
     {
-        // 步骤1:恢复前向状态
+        // ========== 步骤1：前向状态恢复（逆向工程） ==========
+        // 计算反向权重，用于从积分结果恢复积分前状态
         const float weight = 1.0f / (1.0f - alpha);
 
+        // 🔄 透射率状态恢复：T_before = T_after / (1 - α)
         transmittance *= weight;
-        // 这是Slang的双数（Dual Number）实现：
-        // 值部分：前向计算结果
-        // 微分部分：反向传播梯度
-        // 自动跟踪：计算过程中的梯度传播
         DifferentialPair<float> transmittanceDiff = DifferentialPair<float>(transmittance, transmittanceGrad);
         
-        // 步骤2:恢复积分深度
+        // ========== 步骤2：深度积分状态恢复 ==========
+        // 🔄 深度状态恢复：depth_before = (depth_after - α×hit_depth) / (1 - α)
         integratedDepth = (integratedDepth - depth * alpha) * weight;
         DifferentialPair<float> integratedDepthDiff = DifferentialPair<float>(integratedDepth, integratedDepthGrad);
 
+        // ========== 步骤3：法线积分状态恢复（可选） ==========
         DifferentialPair<float3> integratedNormalDiff;
         if (enableNormal)
         {
+            // 🔄 法线状态恢复：normal_before = (normal_after - α×hit_normal) / (1 - α)
             integratedNormal = (integratedNormal - normal * alpha) * weight;
             integratedNormalDiff = DifferentialPair<float3>(integratedNormal, integratedNormalGrad);
         }
         else
         {
+            // 不处理法线时设置零值微分对
             integratedNormalDiff = DifferentialPair<float3>(float3(0), float3(0));
         }
 
-        // 步骤3:调用自动微分引擎
+        // ========== 步骤4：调用Slang自动微分引擎 ==========
+        // 🚀 关键：bwd_diff() 自动生成复杂的几何变换梯度计算
+        // 功能：∂L/∂α → ∂L/∂(位置,旋转,缩放,密度) 的完整变换
+        // 结果：自动更新全局高斯参数缓冲区梯度
         bwd_diff(gaussianParticle.processHitFromBuffer<true>)(
-            rayOrigin,
-            rayDirection,
-            particleIdx,
-            commonParameters.parametersBuffer,
-            transmittanceDiff,
-            integratedDepthDiff,
-            enableNormal,
-            integratedNormalDiff,
-            alphaGrad);
+            rayOrigin,                          // 光线起点（世界坐标）
+            rayDirection,                       // 光线方向（世界坐标）
+            particleIdx,                        // 粒子索引
+            commonParameters.parametersBuffer,   // 高斯参数缓冲区（数据+梯度）
+            transmittanceDiff,                  // 透射率的微分对
+            integratedDepthDiff,                // 深度的微分对
+            enableNormal,                       // 法线处理标志
+            integratedNormalDiff,               // 法线的微分对
+            alphaGrad);                         // alpha梯度输入
 
+        // ========== 步骤5：提取更新后的梯度 ==========
         transmittanceGrad = transmittanceDiff.getDifferential();
         integratedDepthGrad = integratedDepthDiff.getDifferential();
         if (enableNormal)

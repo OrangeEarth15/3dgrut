@@ -857,8 +857,27 @@ __device__ inline bool intersectInstanceParticle(
 // 【应用】3DGS模型的端到端训练
 //
 // 【核心思想】
-// 反向传播是前向传播的逆过程，通过链式法则将输出梯度
-// 传播到所有可训练参数上，实现端到端的神经网络训练
+/**
+ * 🔬 反向传播粒子击中处理 - 调用链第3层：最底层数学实现
+ * 
+ * 📋 调用链位置:
+ *   1. evalBackwardNoKBuffer (gutKBufferRenderer.cuh:677) → particles.processHitBwd<>()
+ *   2. C++包装层 (shRadiativeGaussianParticles.cuh:858) → threedgut::processHitBwd<>()
+ *   3. 【当前层】最底层实现 (gaussianParticles.cuh:863) → 直接执行数学梯度计算
+ * 
+ * 🎯 本层职责: 执行所有梯度计算的数学公式
+ *   - 重现前向传播的所有中间计算结果
+ *   - 使用链式法则计算每个参数的梯度
+ *   - 直接执行矩阵运算、四元数微分、核函数梯度等
+ *   - 无更深层调用，纯数学计算实现
+ * 
+ * 🔢 数学内容:
+ *   - 高斯椭球核函数的反向微分
+ *   - 四元数旋转矩阵的梯度传播
+ *   - 位置、缩放、密度参数的链式求导
+ *   - 球谐光照系数的反向传播
+ *   - 体积渲染积分的逆运算
+ */
 template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false, bool PerRayRadiance = true>
 __device__ inline void processHitBwd(
     const float3& rayOrigin,                      // 光线起点（世界坐标）
@@ -881,6 +900,8 @@ __device__ inline void processHitBwd(
     float integratedDepth,                        // 累积深度（用于梯度计算）
     float& depth,                                 // [输入输出] 当前深度
     float depthGrad) {                            // 深度的梯度（从输出反传）
+
+    // ======================================================= 重演前向计算（步骤1-4）：重新计算前向传播的中间结果 =======================================================
     // =============== 步骤1: 粒子参数提取和前向计算重现 ===============
     // 【重要说明】反向传播需要重现前向传播的所有中间计算结果
     // 这些值将用于计算各个参数的梯度
@@ -901,6 +922,7 @@ __device__ inline void processHitBwd(
 
     // =============== 步骤2: 坐标变换（重现前向传播的几何计算） ===============
     // 这些计算与前向传播完全一致，用于获得梯度计算所需的中间变量
+    // 将任意椭球粒子的光线交互问题转换为标准单位球的光线交互问题，简化计算。
     
     const float3 giscl   = make_float3(1 / gscl.x, 1 / gscl.y, 1 / gscl.z);  // 逆缩放系数
     const float3 gposc   = (rayOrigin - particlePosition);                     // 平移变换
@@ -928,9 +950,13 @@ __device__ inline void processHitBwd(
         // =============== 步骤4: 深度和权重计算（重现前向传播） ===============
         
         // 4.1 计算击中距离相关的中间变量
+        // grd 是光线方向在粒子标准化坐标系下的表示
+        // gro 是ray->particle在粒子标准化坐标系下的表示
+        // 这里计算的是光线参数 t，使得 P(t) = gro + t * grd 是光线与粒子的交点。
         const float3 grdd   = grd * (SurfelPrimitive ? 
             -gro.z / grd.z :           // 面片模式：z轴投影
             dot(grd, -1 * gro));       // 体积模式：方向投影
+        // 变换回原始空间的距离向量
         const float3 grds   = gscl * grdd;          // 应用缩放变换
         const float gsqdist = dot(grds, grds);      // 距离平方
         const float gdist   = sqrtf(gsqdist);       // 实际距离
@@ -938,6 +964,8 @@ __device__ inline void processHitBwd(
         // 4.2 计算权重和透射率
         const float weight = galpha * transmittance;           // 当前粒子的贡献权重
         const float nextTransmit = (1 - galpha) * transmittance;  // 更新后的透射率
+
+        // =============================================== 梯度分解与传播（步骤5-14）：将最终梯度分解并传播给各个中间变量 ===============================================
 
         // =============== 步骤5: 深度梯度计算 ===============
         // 【数学原理】深度的前向公式：depth += weight * gdist
@@ -948,12 +976,14 @@ __device__ inline void processHitBwd(
         
         // 5.2 计算剩余深度（用于梯度计算）
         // 【物理含义】当前透射率小于阈值时，后续光线贡献可忽略
+        // residualHitT = (总累积深度 - 当前深度) / 剩余透射率，因为后面每个深度计算都要*nextTransmit
         const float residualHitT = fmaxf(
             (nextTransmit <= minTransmittance ? 0 : (integratedDepth - depth) / nextTransmit), 
             0);
 
         // =============== 步骤6: 深度对alpha的梯度计算 ===============
         // 【数学推导】深度的完整公式：
+        // hitT = accumHitT + α×T×gdist + (1-α)×T×residualHitT
         // hitT = accumulatedHitT + galpha * prevTrm * gdist + (1-galpha) * prevTrm * residualHitT
         //
         // 【链式法则】∂L/∂galpha = ∂L/∂hitT * ∂hitT/∂galpha
@@ -1009,6 +1039,8 @@ __device__ inline void processHitBwd(
 
         // =============== 步骤10: 球谐函数和颜色梯度计算 ===============
         // 【目标】计算辐射度对球谐系数和几何参数的梯度
+        // 特征系统 (particles.featuresIntegrateBwd 等价逻辑)
+
         
         float3 grad;  // 存储球谐函数对视角方向的梯度
         
@@ -1050,7 +1082,7 @@ __device__ inline void processHitBwd(
         // rayRadiance = accumulatedRayRad + weight * rayRad + (1-galpha) * transmit * residualRayRad
         
         // 11.1 更新当前辐射度（重现前向传播）
-        const float3 rayRad = weight * grad;
+        const float3 rayRad = weight * grad; // gaussian_radiance
         radiance += rayRad;
         
         // 11.2 计算剩余辐射度（用于梯度计算）
@@ -1102,6 +1134,9 @@ __device__ inline void processHitBwd(
         //
         // 【具体实现】particleResponseGrd函数封装了不同阶数的梯度计算
         const float grayDistGrd = particleResponseGrd<ParticleKernelDegree>(grayDist, gres, gresGrd);
+
+
+        // =============================================== 参数梯度计算（步骤15-18）：将中间变量的梯度转换为最终参数梯度 ===============================================
 
         // =============== 步骤15: 几何距离的反向梯度传播 ===============
         // 【分支处理】根据渲染模式选择不同的梯度计算方法

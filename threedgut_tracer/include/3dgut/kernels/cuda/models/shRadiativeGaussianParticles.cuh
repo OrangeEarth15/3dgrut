@@ -397,7 +397,26 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     template <bool exclusiveGradient>
-    // 密度光线击中反向传播到缓冲区
+    /**
+     * 📋 DENSITY反向传播调用链（第2层/4层）- C++到Slang桥接层
+     * 
+     * 🔄 调用路径：
+     * 1. 上层：gutKBufferRenderer.cuh:205 → particles.densityProcessHitBwdToBuffer<false>()
+     * 2. 【当前层】shRadiativeGaussianParticles.cuh:417 → particleDensityProcessHitBwdToBuffer()
+     * 3. 下层：gaussianParticles.slang:1063 → [Slang自动微分系统]
+     * 
+     * 🎯 本层职责：类型转换和参数组织
+     * - TCNN向量类型 → CUDA原生float3类型  
+     * - 封装高斯粒子参数缓冲区信息（几何参数指针+梯度指针）
+     * - 处理可选参数（法线计算的条件处理）
+     * - 传递exclusiveGradient控制（性能优化标志）
+     * 
+     * 🧮 数学原理：
+     * - 从∂L/∂alpha反向传播到∂L/∂(位置,旋转,缩放,密度)
+     * - 链式法则：∂L/∂θ = ∂L/∂alpha × ∂alpha/∂θ 
+     * - 涉及复杂的坐标变换链：世界坐标→粒子坐标→标准化坐标
+     * - 高斯核函数的导数：∂G/∂θ = 梯度(exp(-0.5×|变换后距离|²))
+     */
     __forceinline__ __device__ void densityProcessHitBwdToBuffer(const tcnn::vec3& rayOrigin,
                                                                  const tcnn::vec3& rayDirection,
                                                                  uint32_t particleIdx,
@@ -414,6 +433,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
 
     ) const {
         if constexpr (TDifferentiable) {
+            // 🌉 关键桥接：C++ → Slang，复杂的类型转换和参数重组
             particleDensityProcessHitBwdToBuffer(*reinterpret_cast<const float3*>(&rayOrigin),
                                                  *reinterpret_cast<const float3*>(&rayDirection),
                                                  particleIdx,
@@ -749,7 +769,24 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     template <bool exclusiveGradient>
-    // 特征反向积分到缓冲区
+    /**
+     * 📋 FEATURES反向传播调用链（第2层/5层）- C++到Slang桥接层
+     * 
+     * 🔄 调用路径：
+     * 1. 上层：gutKBufferRenderer.cuh:172 → particles.featuresIntegrateBwdToBuffer<false>()
+     * 2. 【当前层】shRadiativeGaussianParticles.cuh:753 → particleFeaturesIntegrateBwdToBuffer()  
+     * 3. 下层：shRadiativeParticles.slang:485 → [Slang自动微分系统]
+     * 
+     * 🎯 本层职责：类型转换和参数封装
+     * - TCNN向量类型 → CUDA原生float3类型
+     * - 封装球谐参数缓冲区信息（数据指针+梯度指针+度数）
+     * - 传递exclusiveGradient标志（控制原子操作vs直接写入）
+     * 
+     * 🧮 数学原理：
+     * - 从∂L/∂RGB反向传播到∂L/∂(球谐系数)
+     * - 链式法则：∂L/∂c_i = ∂L/∂RGB × ∂RGB/∂c_i
+     * - ∂RGB/∂c_i = Y_i(ω) (球谐基函数在观察方向ω的值)
+     */
     __forceinline__ __device__ void featuresIntegrateBwdToBuffer(const tcnn::vec3& incidentDirection,
                                                                  float alpha,
                                                                  float& alphaGrad,
@@ -759,6 +796,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                                  TFeaturesVec& integratedFeaturesGrad) const {
 
         if (TDifferentiable) {
+            // 🌉 关键桥接：C++ → Slang，类型转换和参数封装
             particleFeaturesIntegrateBwdToBuffer(*reinterpret_cast<const float3*>(&incidentDirection),
                                                  alpha,
                                                  &alphaGrad,
@@ -822,107 +860,155 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     /**
-     * 光线击中反向处理（梯度反向传播）
+     * 反向传播粒子击中处理
      * 
-     * 功能：实现processHitFwd的梯度反向传播，用于神经网络训练
-     * 复杂性：这是整个系统中最复杂的函数之一，涉及多层梯度
+     * 输入：
+     *   rayOrigin, rayDirection     - 光线几何
+     *   particleIdx                 - 粒子索引
+     *   densityRawParameters        - 粒子几何参数(Forward值)
+     *   particleFeatures            - 粒子特征(Forward值)  
+     *   transmittanceBackward       - Forward计算的最终透射率
+     *   featuresBackward            - Forward计算的最终特征
+     *   hitTBackward               - Forward计算的最终击中距离
+     *   transmittanceGradient       - ∂L/∂transmittance
+     *   featuresGradient           - ∂L/∂features  
+     *   hitTGradient               - ∂L/∂hitT
      * 
-     * 反向传播的数学原理：
-     * - 前向：[transmittance, features, hitT] = processHitFwd(rayOrigin, rayDirection, ...)
-     * - 反向：根据输出梯度计算所有输入参数的梯度
-     * - 链式法则：∂Loss/∂input = ∂Loss/∂output * ∂output/∂input
+     * 输出：
+     *   densityRawParametersGrad    - ∂L/∂(位置,旋转,缩放,密度)
+     *   particleFeaturesGradPtr     - ∂L/∂特征 或 ∂L/∂球谐系数
      * 
-     * 梯度类型：
-     * - 几何梯度：位置、旋转、缩放参数的梯度
-     * - 物理梯度：密度参数的梯度
-     * - 光照梯度：球谐系数的梯度
-     * - 空间梯度：透射率、击中距离的梯度
+     * 输入输出：
+     *   transmittance, features, hitT - 当前累积状态，会被更新
      * 
-     * @param rayOrigin 光线起点
-     * @param rayDirection 光线方向
-     * @param particleIdx 粒子索引
-     * @param densityRawParameters 密度参数（前向值）
-     * @param densityRawParametersGrad 密度参数梯度（输出）
-     * @param particleFeatures 粒子特征（前向值）
-     * @param particleFeaturesGradPtr 粒子特征梯度（输出）
-     * @param transmittance 透射率（前向值，可能被修改）
-     * @param transmittanceBackward 透射率的反向值
-     * @param transmittanceGradient 透射率的梯度
-     * @param features 累积特征（前向值，可能被修改）
-     * @param featuresBackward 特征的反向值
-     * @param featuresGradient 特征的梯度
-     * @param hitT 击中距离（前向值，可能被修改）
-     * @param hitTBackward hitT的反向值
-     * @param hitTGradient hitT的梯度
+     * 📋 调用链位置:
+     *   1. evalBackwardNoKBuffer (gutKBufferRenderer.cuh:677) → particles.processHitBwd<>()
+     *   2. 【当前层】C++包装 (shRadiativeGaussianParticles.cuh:858) → threedgut::processHitBwd<>()
+     *   3. 🎯 最底层实现 (gaussianParticles.cuh:863) → 梯度计算数学公式
+     * 
+     * 🔄 本层职责: 类型适配和参数转换
+     *   - 将TCNN向量类型转换为CUDA原生类型 (tcnn::vec3 → float3)  
+     *   - 处理动态vs静态特征模式的分支逻辑
+     *   - 传递模板参数（核函数度数、是否表面、是否动态特征）
+     *   - 维护类型安全的高层API接口
+     * 
+     * ⚡ 性能优化:
+     *   - reinterpret_cast零开销类型转换
+     *   - constexpr条件编译时分支消除
+     *   - 内联函数避免调用开销
      */
     template <bool PerRayRadiance>
-    __forceinline__ __device__ void processHitBwd(const tcnn::vec3& rayOrigin,
-                                                  const tcnn::vec3& rayDirection,
-                                                  uint32_t particleIdx,
-                                                  const DensityRawParameters& densityRawParameters,
-                                                  DensityRawParameters* densityRawParametersGrad,
-                                                  const TFeaturesVec& particleFeatures,
-                                                  TFeaturesVec* particleFeaturesGradPtr,
-                                                  float& transmittance,
-                                                  float transmittanceBackward,
-                                                  float transmittanceGradient,
-                                                  TFeaturesVec& features,
-                                                  const TFeaturesVec& featuresBackward,
-                                                  const TFeaturesVec& featuresGradient,
-                                                  float& hitT,
-                                                  float hitTBackward,
-                                                  float hitTGradient) const {
+    __forceinline__ __device__ void processHitBwd(
+        const tcnn::vec3& rayOrigin,                    // 光线起点（TCNN向量格式）
+        const tcnn::vec3& rayDirection,                 // 光线方向（TCNN向量格式）  
+        uint32_t particleIdx,                           // 粒子索引
+        const DensityRawParameters& densityRawParameters,    // 粒子几何参数（Forward值）
+        DensityRawParameters* densityRawParametersGrad,      // 几何参数梯度输出缓冲区
+        const TFeaturesVec& particleFeatures,               // 粒子特征（Forward值）
+        TFeaturesVec* particleFeaturesGradPtr,              // 特征梯度输出缓冲区
+        float& transmittance,                               // 当前透射率（会被修改）
+        float transmittanceBackward,                        // Forward计算的透射率
+        float transmittanceGradient,                        // 透射率梯度输入
+        TFeaturesVec& features,                             // 当前特征（会被修改）
+        const TFeaturesVec& featuresBackward,               // Forward计算的特征
+        const TFeaturesVec& featuresGradient,               // 特征梯度输入
+        float& hitT,                                        // 当前击中距离（会被修改）
+        float hitTBackward,                                 // Forward计算的击中距离
+        float hitTGradient                                  // 击中距离梯度输入
+    ) const {
         
-        // 🎓 调用高度优化的反向传播C++内核
+        // ========== 调用第3层：最底层C++反向传播实现 ==========
+        // 🎯 关键转换: 高层模板化API → 底层优化实现
         threedgut::processHitBwd<ExtParams::KernelDegree, false, PerRayRadiance>(
-            reinterpret_cast<const float3&>(rayOrigin),
-            reinterpret_cast<const float3&>(rayDirection),
+            // 🔄 类型转换：TCNN向量 → CUDA原生类型
+            reinterpret_cast<const float3&>(rayOrigin),     // tcnn::vec3 → float3
+            reinterpret_cast<const float3&>(rayDirection),  // tcnn::vec3 → float3
+            
+            // 🏷️ 粒子标识和参数
             particleIdx,
-            reinterpret_cast<const threedgut::ParticleDensity&>(densityRawParameters),
-            reinterpret_cast<threedgut::ParticleDensity*>(densityRawParametersGrad),
-            PerRayRadiance ? reinterpret_cast<const float*>(m_featureRawParameters.ptr) : reinterpret_cast<const float*>(particleFeatures.data()),
-            PerRayRadiance ? reinterpret_cast<float*>(m_featureRawParameters.gradPtr) : reinterpret_cast<float*>(particleFeaturesGradPtr),
-            ExtParams::MinParticleKernelDensity,   // 最小密度响应阈值
-            ExtParams::AlphaThreshold,             // 最小透明度阈值
-            ExtParams::MinTransmittanceThreshold,  // 最小透射率阈值（早停优化）
-            m_featureActiveShDegree,
-            transmittanceBackward,
-            transmittance,
-            transmittanceGradient,
-            reinterpret_cast<const float3&>(featuresBackward),
-            reinterpret_cast<float3&>(features),
-            reinterpret_cast<const float3&>(featuresGradient),
-            hitT,
-            hitTBackward,
-            hitTGradient);
+            reinterpret_cast<const threedgut::ParticleDensity&>(densityRawParameters),     // 几何参数
+            reinterpret_cast<threedgut::ParticleDensity*>(densityRawParametersGrad),       // 几何梯度
+            
+            // 🎨 特征数据分支：动态 vs 静态特征
+            PerRayRadiance ? 
+                reinterpret_cast<const float*>(m_featureRawParameters.ptr) :        // 动态：从球谐系数计算
+                reinterpret_cast<const float*>(particleFeatures.data()),           // 静态：使用预计算特征
+            PerRayRadiance ? 
+                reinterpret_cast<float*>(m_featureRawParameters.gradPtr) :         // 动态：球谐梯度缓冲区
+                reinterpret_cast<float*>(particleFeaturesGradPtr),                 // 静态：特征梯度缓冲区
+            
+            // 🎛️ 算法控制参数
+            ExtParams::MinParticleKernelDensity,   // 最小核响应阈值（early culling）
+            ExtParams::AlphaThreshold,             // 最小alpha阈值（透明度过滤）
+            ExtParams::MinTransmittanceThreshold,  // 最小透射率阈值（early termination）
+            m_featureActiveShDegree,               // 球谐函数活跃度数
+            
+            // 🔄 反向传播状态：Forward值 + 梯度输入
+            transmittanceBackward,                  // Forward透射率
+            transmittance,                          // 当前透射率（输入输出）
+            transmittanceGradient,                  // 透射率梯度
+            reinterpret_cast<const float3&>(featuresBackward),  // Forward特征
+            reinterpret_cast<float3&>(features),                // 当前特征（输入输出） 
+            reinterpret_cast<const float3&>(featuresGradient),  // 特征梯度
+            hitT,                                   // 当前击中距离（输入输出）
+            hitTBackward,                           // Forward击中距离
+            hitTGradient);                          // 击中距离梯度
     }
 
-    // 📄 【论文技术实现】部分负载均衡（Warp级别协作）
-    // 论文描述："利用warp voting和shuffle指令在每个warp内重新分配剩余的工作负载"
-    // 🔄 实现了论文中"第二阶段"的warp内工作重分配
+    /**
+     * 🚀 特征梯度更新 - 调用链第2层：最终执行层（无更深调用）
+     * 
+     * 📋 调用链位置:
+     *   1. evalBackwardNoKBuffer (gutKBufferRenderer.cuh:699) → particles.processHitBwdUpdateFeaturesGradient()
+     *   2. 🎯 【当前层】最终执行层 → 直接执行 Warp协作 + 原子操作
+     * 
+     * 🎓 论文技术实现: "部分负载均衡（Warp级别协作）"
+     *   论文描述: "利用warp voting和shuffle指令在每个warp内重新分配剩余的工作负载"
+     *   核心思想: 将32个线程的梯度先聚合，再一次性原子更新，减少内存竞争
+     * 
+     * ⚡ 性能优化原理:
+     *   - 🔄 Warp内并行归约：32个线程协作计算总梯度
+     *   - 🎯 单线程原子操作：仅第一个线程执行昂贵的atomicAdd
+     *   - 📊 内存带宽优化：减少到全局内存的写入次数（32→1）
+     *   - 🚀 竞争减少：降低原子操作的序列化开销
+     * 
+     * 🔬 算法细节:
+     *   synchedThread=true:  O(log32) + 1次原子操作 = ~6次shuffle + 1次atomicAdd
+     *   synchedThread=false: 32次原子操作 = 32次atomicAdd (用于对比)
+     */
     template <bool synchedThread = true>
-    // 反向处理更新特征梯度
-    __forceinline__ __device__ void processHitBwdUpdateFeaturesGradient(uint32_t particleIdx, TFeaturesVec& featuresGrad, TFeaturesVec* featuresGradSum, uint32_t tileThreadIdx) {
+    __forceinline__ __device__ void processHitBwdUpdateFeaturesGradient(
+        uint32_t particleIdx,           // 目标粒子索引
+        TFeaturesVec& featuresGrad,     // 当前线程计算的特征梯度
+        TFeaturesVec* featuresGradSum,  // 全局特征梯度累积数组
+        uint32_t tileThreadIdx          // tile内线程索引（用于warp内定位）
+    ) {
         if constexpr (synchedThread) {
-            // 🔄 实现论文的"shuffle指令"：warp内的并行归约操作
-            // 利用32个线程同时工作，实现高效的数据聚合 (Perform warp reduction)
+            // ========== 第1步: Warp内并行归约（Butterfly Reduction Pattern） ==========
+            // 🔄 使用shuffle指令实现高效的树形归约
+            // 模式: 32线程 → 16线程 → 8线程 → 4线程 → 2线程 → 1线程
 #pragma unroll
-            for (int mask = 1; mask < warpSize; mask *= 2) {
+            for (int mask = 1; mask < warpSize; mask *= 2) {  // mask: 1,2,4,8,16 (log2(32)=5轮)
 #pragma unroll
                 for (int i = 0; i < ExtParams::FeaturesDim; ++i) {
+                    // 📡 __shfl_xor_sync: 与距离mask的线程交换数据并累加
+                    // 例如: thread0与thread1交换，thread2与thread3交换...
                     featuresGrad[i] += __shfl_xor_sync(0xffffffff, featuresGrad[i], mask);
                 }
             }
 
-            // 🎯 第一个线程负责原子加法：进一步的负载均衡优化
-            // First thread in the warp performs the atomic add
-            if ((tileThreadIdx & (warpSize - 1)) == 0) {
+            // ========== 第2步: 单线程原子更新（Warp Leader Optimization） ==========
+            // 🎯 经过归约后，只有第一个线程（lane 0）拥有完整的warp总梯度
+            if ((tileThreadIdx & (warpSize - 1)) == 0) {  // 检查是否为warp的第一个线程
 #pragma unroll
                 for (int i = 0; i < ExtParams::FeaturesDim; i++) {
+                    // 💥 关键原子操作：将整个warp的梯度一次性累加到全局数组
                     atomicAdd(&featuresGradSum[particleIdx][i], featuresGrad[i]);
                 }
             }
         } else {
+            // ========== 备选方案: 直接原子更新（用于性能对比） ==========
+            // ⚠️ 低效模式：每个线程独立执行原子操作，导致大量内存竞争
 #pragma unroll
             for (int i = 0; i < ExtParams::FeaturesDim; ++i) {
                 atomicAdd(&featuresGradSum[particleIdx][i], featuresGrad[i]);
@@ -930,18 +1016,36 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
         }
     }
 
-    // 📄 【论文技术实现】Warp级别负载均衡的深度应用
-    // 论文描述："利用warp voting和shuffle指令在每个warp内重新分配剩余的工作负载"
-    // 🎯 对于粒子参数梯度，使用更高效的warp协作归约
+    /**
+     * 🎛️ 密度梯度更新 - 调用链第2层：最终执行层（无更深调用）
+     * 
+     * 📋 调用链位置:
+     *   1. evalBackwardNoKBuffer (gutKBufferRenderer.cuh:704) → particles.processHitBwdUpdateDensityGradient()
+     *   2. 🎯 【当前层】最终执行层 → 直接执行 复合参数Warp协作
+     * 
+     * 🎓 论文技术实现: "Warp级别负载均衡的深度应用" 
+     *   论文描述: "利用warp voting和shuffle指令在每个warp内重新分配剩余的工作负载"
+     *   高级优化: 同时处理位置(3D)、四元数(4D)、缩放(3D)、密度(1D)共11个参数
+     * 
+     * ⚡ 相比特征梯度的复杂性:
+     *   - 🎨 特征梯度: 3个float (RGB颜色)
+     *   - 🔧 几何梯度: 11个float (位置3 + 四元数4 + 缩放3 + 密度1)
+     *   - 📊 归约复杂度: ~3.7倍的数据量，但相同的warp协作效率
+     * 
+     * 🚀 性能关键: 几何参数直接影响粒子的3D变换，梯度精度对收敛至关重要
+     */
     template <bool synchedThread = true>
-    // 反向处理更新密度梯度
-    __forceinline__ __device__ void processHitBwdUpdateDensityGradient(uint32_t particleIdx, DensityRawParameters& densityRawParameters, uint32_t tileThreadIdx) {
+    __forceinline__ __device__ void processHitBwdUpdateDensityGradient(
+        uint32_t particleIdx,                       // 目标粒子索引
+        DensityRawParameters& densityRawParameters, // 当前线程计算的几何参数梯度
+        uint32_t tileThreadIdx                      // tile内线程索引（warp内定位）
+    ) {
         if constexpr (synchedThread) {
-            // 🔄 高效warp内并行归约：对粒子的所有参数同时进行梯度聚合
-            // 这是论文"第二阶段负载均衡"的具体实现：用shuffle指令高效分享数据
-            // Perform warp reduction
+            // ========== 第1步: 复合参数的Warp内并行归约 ==========
+            // 🔄 对粒子的所有几何参数同时进行梯度聚合（11个标量）
+            // 这是论文"第二阶段负载均衡"的具体实现：高维参数空间的协作优化
 #pragma unroll
-            for (int mask = 1; mask < warpSize; mask *= 2) {
+            for (int mask = 1; mask < warpSize; mask *= 2) {  // 5轮butterfly reduction
                 // 位置梯度的warp归约
                 densityRawParameters.position.x += __shfl_xor_sync(0xffffffff, densityRawParameters.position.x, mask);
                 densityRawParameters.position.y += __shfl_xor_sync(0xffffffff, densityRawParameters.position.y, mask);

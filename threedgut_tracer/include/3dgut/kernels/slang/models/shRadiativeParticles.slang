@@ -190,86 +190,115 @@ vector<float, Dim> radianceFromBuffer(no_diff uint32_t particleIdx,
                incidentDirection);
 }
 
-// ========== integrateRadiance调用链 - 第4层：核心实现算法 ==========
-//
-// 🎨 【调用链终点】：
-// 1. K-Buffer (gutKBufferRenderer.cuh:264) → particles.featureIntegrateFwd()
-// 2. C++包装 (shRadiativeGaussianParticles.cuh:661) → particleFeaturesIntegrateFwd()
-// 3. Slang导出 (shRadiativeParticles.slang:299) → shRadiativeParticle.integrateRadiance<false>()
-// 4. 【当前层】核心实现 (shRadiativeParticles.slang:205) → 颜色混合算法
-//
-// 【本层作用】：球谐辐射粒子的颜色混合数学实现
-// - 这是颜色调用链的最底层，实现真正的颜色混合算法
-// - 支持两种混合模式：直接累积和线性插值
-// - 适配不同的渲染算法：K-Buffer、排序透明、Over混合
-// - 通过模板参数在编译时优化性能
-//
-// 🌌 【球谐光照背景】：
-// - 传统3DGS：每个粒子 → 固定RGB颜色
-// - 球谐3DGS：每个粒子 → 球谐系数数组 → 基于观察方向计算颜色
-// - 计算流程：存储系数 → 球谐基函数解码 → 按权重混合
-// - 优势：紧凑表示、连续插值、视角相关光照效果
-//
-// 🎨 【数学原理】：
-// 颜色混合公式（与Alpha混合对应）：
-// 前向后模式：integratedColor += particleColor × weight
-// 后向前模式：integratedColor = lerp(oldColor, particleColor, weight)
-// 其中 weight = alpha × transmittance (由densityIntegrateHit计算)
-//
-// 📊 【性能优化】：
-// - [BackwardDifferentiable] 支持自动微分，用于神经网络训练
-// - [ForceInline] 强制内联展开，减少函数调用开销
-// - 模板特化 <let backToFront : bool> 编译时分支消除
-// - weight > 0.0f 早期退出优化，避免无效计算
-//
 /**
- * 积分辐射亮度（体积渲染混合）- 核心实现算法
+ * 📋 FEATURES反向传播调用链（最终层）- 体积渲染积分的数学实现
  * 
- * 【核心功能】：
- * 这是3DGUT系统中颜色混合的数学核心，实现体积渲染中的辐射亮度积分。
- * 支持两种混合模式，通过模板参数在编译时优化：
- * 1. 前向后模式：直接累加权重值 (K-Buffer使用)
- * 2. 后向前模式：使用线性插值混合（适用于预积分的alpha混合）
+ * 🔄 调用路径（到达算法终点）：
+ * 1. 上4层：gutKBufferRenderer.cuh:172 → ... → shRadiativeParticles.slang:320
+ * 2. 【当前层】shRadiativeParticles.slang:244 → 体积渲染的积分数学公式
  * 
- * 这个函数处理：
- * - 球谐辐射特征的数值积分
- * - 多层透明粒子的颜色合成
- * - 视角相关光照效果的累积
+ * 🎯 本层职责：3DGUT体积渲染的数学核心
+ * - 实现两种积分模式的数学公式
+ * - 处理多层透明粒子的颜色合成
+ * - 支持自动微分的反向传播
+ * - 编译时优化的模板特化
  * 
- * @param weight 混合权重（由densityIntegrateHit计算：alpha × transmittance）
- * @param radiance 当前粒子的辐射亮度向量（RGB或球谐解码结果）
- * @param integratedRadiance 累积的辐射亮度（输入输出参数，最终像素颜色）
+ * 🧮 体积渲染积分的数学原理：
+ * 
+ * 前向后模式（K-Buffer标准）：
+ * ∫ color += particle_color × weight
+ * 特点：简单累加，适合无序透明渲染
+ * 
+ * 后向前模式（深度排序）：
+ * ∫ color = lerp(old_color, particle_color, weight)
+ * 特点：线性插值，适合有序透明渲染
+ * 
+ * 🔗 反向传播梯度计算：
+ * - 前向后：∂∫color/∂particle_color = weight
+ * - 后向前：∂∫color/∂particle_color = weight, ∂∫color/∂old_color = (1-weight)
+ * 
+ * ⚡ 性能优化技术：
+ * - 早期退出：weight <= 0.0f 零开销跳过
+ * - 编译时分支：let模板参数消除运行时判断
+ * - 强制内联：函数调用开销完全消除
+ * - 自动微分：Slang编译器自动生成反向版本
+ * 
+ * @param weight 混合权重（alpha × transmittance，决定粒子贡献）
+ * @param radiance 当前粒子的辐射亮度（球谐解码后的RGB值）
+ * @param integratedRadiance 累积辐射亮度（输入输出，最终像素颜色）
  */
 [BackwardDifferentiable][ForceInline]
 void integrateRadiance<let backToFront : bool>(float weight,
                                                in vector<float, Dim> radiance,
                                                inout vector<float, Dim> integratedRadiance)
 {
-    // ========== 步骤1：早期退出优化 ==========
-    // 关键：只有有效权重的粒子才进行颜色混合
-    // 避免无效计算，提高GPU执行效率
+    // ========== 最终层步骤1：早期退出优化 ==========
+    // 🚀 GPU性能关键：只有有效权重的粒子才进行颜色混合
+    // 数值含义：weight = alpha × transmittance，表示粒子的实际贡献度
     if (weight > 0.0f)
     {
-        // ========== 步骤2：根据渲染模式选择混合算法 ==========
+        // ========== 最终层步骤2：体积渲染积分的核心数学公式 ==========
+        // 🧮 这里是整个3DGUT体积渲染的数学终点！
+        // 所有复杂的球谐光照、几何变换、透明度计算最终归结为这两个简单公式
+        
         if (backToFront)
         {
-            // 后向前模式：线性插值混合（Over算子）
-            // 公式：result = lerp(old, new, weight) = old * (1-weight) + new * weight
-            // 适用于：深度排序渲染、Alpha混合等
+            // 🔄 后向前模式：Over算子（深度排序时使用）
+            // 数学公式：C_final = C_old × (1-w) + C_particle × w
+            // 物理意义：线性插值混合，保持颜色的平滑过渡
+            // 反向梯度：∂C_final/∂C_particle = w, ∂C_final/∂C_old = (1-w)
             integratedRadiance = lerp(integratedRadiance, radiance, weight);
         }
         else
         {
-            // 前向后模式：直接累加（正向穿越）
-            // 公式：result += radiance * weight (加权平均)
-            // 适用于：K-Buffer、体积渲染等
-            // 关键：这是3DGUT中K-Buffer使用的主要模式
+            // ⚡ 前向后模式：累积算子（K-Buffer标准模式）
+            // 数学公式：C_final += C_particle × w
+            // 物理意义：直接累加加权贡献，实现多粒子透明效果
+            // 反向梯度：∂C_final/∂C_particle = w（更简单的梯度计算）
+            // 🎯 3DGUT的主要使用模式：高效的无序透明渲染
             integratedRadiance += radiance * weight;
         }
     }
-    // 注意：函数为void类型，直接修改integratedRadiance参数
+    // 🚫 weight <= 0：粒子距离太远或alpha太小，对最终颜色无贡献
+    // 编译器优化：这个分支在GPU上接近零开销
 }
 
+/**
+ * 📋 FEATURES反向传播调用链（第5层/5层）- 球谐解码与积分的数学核心
+ * 
+ * 🔄 调用路径（到达最终层）：
+ * 1. 上4层：gutKBufferRenderer.cuh:172 → ... → shRadiativeParticles.slang:325
+ * 2. 【当前层】shRadiativeParticles.slang:274 → sphericalHarmonics.decode<>() + integrateRadiance<backToFront>()
+ * 
+ * 🎯 本层职责：球谐光照的数学实现核心
+ * - 球谐解码：将紧凑的系数数组解码为指定方向的RGB值
+ * - 体积积分：将解码的RGB按权重积分到最终像素颜色
+ * - 自动微分：支持系数到RGB到像素的完整梯度链
+ * 
+ * 🧮 数学原理 - 球谐光照的完整实现：
+ * 1. 球谐解码：RGB(ω) = Σ(i=0 to N-1) c_i × Y_i(ω)
+ *    - c_i：第i个球谐系数（3D向量，对应RGB）
+ *    - Y_i(ω)：第i个球谐基函数在方向ω的值
+ *    - N：系数数量，由球谐阶数决定（1,4,9,16...）
+ * 
+ * 2. 体积积分：pixel_color += weight × RGB(ω)
+ *    - weight：粒子贡献权重（alpha × transmittance）
+ *    - 实现视角相关的光照效果累积
+ * 
+ * 🔗 反向传播梯度流：
+ * ∂L/∂pixel → ∂L/∂RGB → ∂L/∂c_i (通过球谐基函数导数)
+ * 
+ * ⚡ 性能优化：
+ * - 早期退出：weight <= 0.0f 直接跳过计算
+ * - 强制内联：消除函数调用开销
+ * - 模板特化：编译时确定积分模式
+ * 
+ * @param incidentDirection 入射光线方向（观察方向，影响球谐基函数值）
+ * @param sphDegree 球谐函数阶数（决定使用的系数数量和计算精度）
+ * @param weight 混合权重（alpha × transmittance，决定粒子贡献）
+ * @param parameters 球谐系数结构体（包含所有系数的完整数组）
+ * @param integratedRadiance 累积辐射亮度（输入输出，最终像素颜色）
+ */
 [BackwardDifferentiable][ForceInline]
 void integrateRadianceFromParameters<let backToFront : bool>(float3 incidentDirection,
                                                              no_diff uint32_t sphDegree,
@@ -277,19 +306,48 @@ void integrateRadianceFromParameters<let backToFront : bool>(float3 incidentDire
                                                              Parameters parameters,
                                                              inout vector<float, Dim> integratedRadiance) 
 {
+    // ========== 早期退出优化 ==========
     if (weight > 0.0f) 
     {
+        // ========== 第5层核心：球谐解码 + 体积积分 ==========
         integrateRadiance<backToFront>(
-            weight,
+            weight,                     // 混合权重（决定粒子对最终颜色的贡献度）
+            
+            // 🌟 关键：球谐基函数解码
+            // 功能：从紧凑的系数数组计算指定方向的RGB颜色
+            // 数学：RGB = Σ(c_i × Y_i(ω))，其中ω是观察方向
             sphericalHarmonics.decode<Dim, RadianceMaxNumSphCoefficients>(
-                sphDegree,
-                parameters.sphCoefficients,
-                incidentDirection),
-            integratedRadiance
+                sphDegree,                      // 球谐阶数（控制计算精度）
+                parameters.sphCoefficients,     // 球谐系数数组（粒子的光照参数）
+                incidentDirection),             // 观察方向（影响最终颜色）
+            
+            integratedRadiance              // 累积结果（最终像素颜色）
         );
     }
+    // 否则：weight <= 0，粒子无贡献，直接跳过所有计算
 }
 
+/**
+ * 📋 FEATURES反向传播调用链（第4层/5层）- 球谐缓冲区接口层
+ * 
+ * 🔄 调用路径：
+ * 1. 上3层：gutKBufferRenderer.cuh:172 → shRadiativeGaussianParticles.cuh:780 → shRadiativeParticles.slang:534
+ * 2. 【当前层】shRadiativeParticles.slang:294 → integrateRadianceFromParameters<backToFront>()
+ * 3. 下层：shRadiativeParticles.slang:301 → integrateRadianceFromParameters<backToFront>() + sphericalHarmonics.decode<>()
+ * 
+ * 🎯 本层职责：从缓冲区获取参数的中转接口
+ * - 粒子参数获取：从全局缓冲区提取指定粒子的所有球谐系数
+ * - 函数转发：将获取的参数传递给真正的积分算法
+ * - 类型保持：维持自动微分兼容性 [BackwardDifferentiable]
+ * 
+ * 🔗 数据流向：
+ * particleIdx + parametersBuffer → fetchParametersFromBuffer() → Parameters结构 → 积分计算
+ * 
+ * 📊 性能特点：
+ * - [ForceInline] 强制内联：消除函数调用开销
+ * - 纯转发函数：实际计算在下一层完成
+ * - 自动微分透传：保持梯度计算能力
+ */
 [BackwardDifferentiable][ForceInline]
 void integrateRadianceFromBuffer<let backToFront : bool>(no_diff float3 incidentDirection,
                                                          no_diff uint32_t sphDegree,
@@ -298,6 +356,9 @@ void integrateRadianceFromBuffer<let backToFront : bool>(no_diff float3 incident
                                                          no_diff ParametersBuffer parametersBuffer,
                                                          inout vector<float, Dim> integratedRadiance)
 {
+    // 🔄 核心转发：缓冲区访问 → 参数结构 → 积分计算
+    // 1. fetchParametersFromBuffer：从全局缓冲区获取粒子的所有球谐系数
+    // 2. integrateRadianceFromParameters：使用获取的参数进行球谐积分计算
     integrateRadianceFromParameters<backToFront>(incidentDirection,
                                                  sphDegree,
                                                  weight,
@@ -468,10 +529,31 @@ inline void particleFeaturesIntegrateFwd(in float weight,
 }
 
 /**
- * 直接向缓冲区进行粒子特征反向积分
+ * 📋 FEATURES反向传播调用链（第3层/5层）- Slang自动微分入口
  * 
- * 组合了反向积分和梯度回写的操作，直接将梯度更新到全局缓冲区。
- * 适用于训练阶段的梯度积累。
+ * 🔄 调用路径：
+ * 1. 上层：gutKBufferRenderer.cuh:172 → particles.featuresIntegrateBwdToBuffer<false>()
+ * 2. 上层：shRadiativeGaussianParticles.cuh:780 → particleFeaturesIntegrateBwdToBuffer()
+ * 3. 【当前层】shRadiativeParticles.slang:485 → bwd_diff(shRadiativeParticle.integrateRadianceFromBuffer<true>)()
+ * 4. 下层：shRadiativeParticles.slang:294 → integrateRadianceFromBuffer<backToFront>()
+ * 5. 下层：shRadiativeParticles.slang:301 → integrateRadianceFromParameters<backToFront>() + sphericalHarmonics.decode<>()
+ * 
+ * 🎯 本层职责：Slang自动微分系统的关键入口
+ * - 设置微分对（DifferentialPair）进行自动微分
+ * - 重构前向状态（为反向传播准备中间值）
+ * - 调用Slang编译器生成的反向微分函数 bwd_diff()
+ * - 自动将梯度传播到球谐系数缓冲区
+ * 
+ * 🧮 反向微分原理：
+ * - Slang编译器自动生成 bwd_diff(forward_function) 反向版本
+ * - DifferentialPair<T> 封装值和梯度，支持链式法则自动应用
+ * - 前向重构：从后向前结果推导前向中间状态（逆向工程）
+ * - 梯度传播：∂L/∂RGB → ∂L/∂球谐系数 (通过球谐基函数的导数)
+ * 
+ * 📊 数学核心：
+ * - 前向：RGB = Σ(c_i × Y_i(ω))  [球谐解码]
+ * - 反向：∂L/∂c_i = ∂L/∂RGB × Y_i(ω)  [链式法则]
+ * - 其中 Y_i(ω) 是球谐基函数在观察方向ω的值
  * 
  * @param incidentDirection 入射光线方向
  * @param alpha 不透明度值
@@ -494,25 +576,31 @@ inline void particleFeaturesIntegrateFwd(in float weight,
 {
     if (alpha > 0.0f)
     {
-        // 创建微分对
+        // ========== 步骤1：创建自动微分对象 ==========
+        // DifferentialPair封装前向值和对应梯度，支持自动链式法则
         DifferentialPair<float> alphaDiff = DifferentialPair<float>(alpha, alphaGrad);
         
-        // 后向前模式的反向重构
+        // ========== 步骤2：前向状态重构 ==========
+        // 从后向前积分结果反推前向中间状态（逆向工程）
+        // 数学：如果 result = old + alpha*features，则 old = (result - alpha*features)/(1-alpha)
         const float weight = 1.0f / (1.0f - alpha);
         integratedFeatures = (integratedFeatures - features * alpha) * weight;
         DifferentialPair<vector<float, shRadiativeParticle.Dim>> integratedFeaturesDiff = 
             DifferentialPair<vector<float, shRadiativeParticle.Dim>>(integratedFeatures, integratedFeaturesGrad);
 
-        // 直接调用带缓冲区更新的反向微分函数
+        // ========== 步骤3：调用Slang自动微分引擎 ==========
+        // 🚀 关键：bwd_diff() 是Slang编译器自动生成的反向微分版本
+        // 功能：自动应用链式法则，将RGB梯度传播到球谐系数梯度
+        // 结果：直接更新全局球谐参数缓冲区的梯度
         bwd_diff(shRadiativeParticle.integrateRadianceFromBuffer<true>)(
-            incidentDirection,
-            commonParameters.sphDegree,
-            alphaDiff,
-            particleIdx,
-            commonParameters.parametersBuffer,
-            integratedFeaturesDiff);
+            incidentDirection,                      // 观察方向（影响球谐基函数值）
+            commonParameters.sphDegree,             // 球谐阶数（决定系数数量）
+            alphaDiff,                             // alpha的微分对
+            particleIdx,                           // 粒子索引
+            commonParameters.parametersBuffer,      // 球谐系数缓冲区（数据+梯度）
+            integratedFeaturesDiff);               // 积分特征的微分对
 
-        // 提取梯度结果
+        // ========== 步骤4：提取梯度结果 ==========
         integratedFeaturesGrad = integratedFeaturesDiff.getDifferential();
         alphaGrad = alphaDiff.getDifferential();
     }
