@@ -54,7 +54,7 @@ __global__ void computeSortedTileRangeIndices(
     }
 
     const uint32_t tileIdx = sortedTileDepthKeys[keyIdx] >> 32;
-    const bool validTile   = tileIdx != threedgut::GUTParameters::Tiling::InvalidTileIdx;
+    const bool validTile   = tileIdx != GUTParameters::Tiling::InvalidTileIdx;
     if (keyIdx == 0) {
         if (validTile) {
             tileRangeIndices[tileIdx].x = keyIdx;
@@ -62,7 +62,7 @@ __global__ void computeSortedTileRangeIndices(
     } else {
         const uint32_t prevKeyTileIdx = sortedTileDepthKeys[keyIdx - 1] >> 32;
         if (prevKeyTileIdx != tileIdx) {
-            if (prevKeyTileIdx != threedgut::GUTParameters::Tiling::InvalidTileIdx) {
+            if (prevKeyTileIdx != GUTParameters::Tiling::InvalidTileIdx) {
                 tileRangeIndices[prevKeyTileIdx].y = keyIdx;
             }
             if (validTile) {
@@ -257,8 +257,8 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
     deviceLaunchesLogger.push("render");
 
     const uvec2 tileGrid{
-        div_round_up<uint32_t>(params.resolution.x, threedgut::GUTParameters::Tiling::BlockX),
-        div_round_up<uint32_t>(params.resolution.y, threedgut::GUTParameters::Tiling::BlockY),
+        div_round_up<uint32_t>(params.resolution.x, GUTParameters::Tiling::BlockX),
+        div_round_up<uint32_t>(params.resolution.y, GUTParameters::Tiling::BlockY),
     };
     const uint32_t numParticles = parameters.values.numParticles;
 
@@ -273,7 +273,7 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
 
     {
         const auto projectProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render::project"};
-        ::projectOnTiles<<<div_round_up(numParticles, threedgut::GUTParameters::Tiling::BlockSize), threedgut::GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
+        ::projectOnTiles<<<div_round_up(numParticles, GUTParameters::Tiling::BlockSize), GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
             tileGrid,
             numParticles,
             params.resolution,
@@ -332,7 +332,7 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
 
     {
         const auto expandProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render::expand"};
-        ::expandTileProjections<<<div_round_up(numParticles, threedgut::GUTParameters::Tiling::BlockSize), threedgut::GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
+        ::expandTileProjections<<<div_round_up(numParticles, GUTParameters::Tiling::BlockSize), GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
             tileGrid,
             numParticles,
             params.resolution,
@@ -386,8 +386,8 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
 #if FINE_GRAINED_LOAD_BALANCING
         // Static allocation: each block handles one virtual tile (VirtualTileSize pixels)
         // Calculate total virtual tiles (each original tile produces VirtualTilesPerTile virtual tiles)
-        constexpr uint32_t VirtualTilesPerTile = threedgut::GUTParameters::Tiling::VirtualTilesPerTile;  // 64 virtual tiles per 16x16 tile
-        constexpr uint32_t ThreadsPerBlock = threedgut::GUTParameters::Tiling::FineGrainedThreadsPerBlock;
+        constexpr uint32_t VirtualTilesPerTile = GUTParameters::Tiling::VirtualTilesPerTile;  // 64 virtual tiles per 16x16 tile
+        constexpr uint32_t ThreadsPerBlock = GUTParameters::Tiling::FineGrainedThreadsPerBlock;
         const uint32_t virtual_tiles_total = tileGrid.x * tileGrid.y * VirtualTilesPerTile;
         
         // LOG_INFO(m_logger, "Static Fine-grained load balancing: virtualTiles=%u, numBlocks=%u, threadsPerBlock=%u", 
@@ -412,7 +412,7 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
         );
 
 #else
-        ::render<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{threedgut::GUTParameters::Tiling::BlockX, threedgut::GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
+        ::render<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
             params, // threedgut::RenderParameters params
             (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
             (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
@@ -467,8 +467,8 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
     deviceLaunchesLogger.push("render-backward");
 
     const uvec2 tileGrid{
-        div_round_up<uint32_t>(params.resolution.x, threedgut::GUTParameters::Tiling::BlockX),
-        div_round_up<uint32_t>(params.resolution.y, threedgut::GUTParameters::Tiling::BlockY),
+        div_round_up<uint32_t>(params.resolution.x, GUTParameters::Tiling::BlockX),
+        div_round_up<uint32_t>(params.resolution.y, GUTParameters::Tiling::BlockY),
     };
     const uint32_t numParticles = parameters.values.numParticles;
 
@@ -499,7 +499,7 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
         // cudaEventCreate(&stopEvent);
         // cudaEventRecord(startEvent, cudaStream);
         
-        ::renderBackward<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{threedgut::GUTParameters::Tiling::BlockX, threedgut::GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
+        ::renderBackward<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
             params,
             (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
             (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
@@ -537,7 +537,7 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
 
     if (!/*m_settings.perRayFeatures*/ TGUTRendererParams::PerRayParticleFeatures) {
         const auto projectProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render-backward::project"};
-        ::projectBackward<<<div_round_up(numParticles, threedgut::GUTParameters::Tiling::BlockSize), threedgut::GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
+        ::projectBackward<<<div_round_up(numParticles, GUTParameters::Tiling::BlockSize), GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
             tileGrid,
             numParticles,
             params.resolution,
