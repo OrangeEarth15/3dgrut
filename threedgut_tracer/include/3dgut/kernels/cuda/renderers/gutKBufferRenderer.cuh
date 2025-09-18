@@ -191,7 +191,7 @@ struct GUTKBufferRenderer : Params {
         const uint32_t tileThreadIdx                 = threadIdx.y * blockDim.x + threadIdx.x;
         const tcnn::uvec2 tileParticleRangeIndices   = sortedTileRangeIndicesPtr[tileIdx];
         uint32_t tileNumParticlesToProcess           = tileParticleRangeIndices.y - tileParticleRangeIndices.x;
-        const uint32_t tileNumBlocksToProcess        = tcnn::div_round_up(tileNumParticlesToProcess, threedgut::GUTParameters::Tiling::BlockSize);
+        const uint32_t tileNumBlocksToProcess        = tcnn::div_round_up(tileNumParticlesToProcess, GUTParameters::Tiling::BlockSize);
         const TFeaturesVec* particleFeaturesBuffer   = Params::PerRayParticleFeatures ? nullptr : reinterpret_cast<const TFeaturesVec*>(particlesPrecomputedFeaturesPtr);
         TFeaturesVec* particleFeaturesGradientBuffer = (Params::PerRayParticleFeatures || !Backward) ? nullptr : reinterpret_cast<TFeaturesVec*>(particlesPrecomputedFeaturesGradPtr);
 
@@ -225,35 +225,35 @@ struct GUTKBufferRenderer : Params {
                                               const TFeaturesVec* __restrict__ particleFeaturesBuffer,
                                               TFeaturesVec* __restrict__ particleFeaturesGradientBuffer) {
         using namespace threedgut;
-        __shared__ PrefetchedParticleData prefetchedParticlesData[threedgut::GUTParameters::Tiling::BlockSize];
+        __shared__ PrefetchedParticleData prefetchedParticlesData[GUTParameters::Tiling::BlockSize];
 
         HitParticleKBuffer<Params::KHitBufferSize> hitParticleKBuffer;
 
-        for (uint32_t i = 0; i < tileNumBlocksToProcess; i++, tileNumParticlesToProcess -= threedgut::GUTParameters::Tiling::BlockSize) {
+        for (uint32_t i = 0; i < tileNumBlocksToProcess; i++, tileNumParticlesToProcess -= GUTParameters::Tiling::BlockSize) {
 
             if (__syncthreads_and(!ray.isAlive())) {
                 break;
             }
 
             // Collectively fetch particle data
-            const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + i * threedgut::GUTParameters::Tiling::BlockSize + tileThreadIdx;
+            const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + i * GUTParameters::Tiling::BlockSize + tileThreadIdx;
             if (toProcessSortedIndex < tileParticleRangeIndices.y) {
                 const uint32_t particleIdx = sortedTileParticleIdxPtr[toProcessSortedIndex];
-                if (particleIdx != threedgut::GUTParameters::InvalidParticleIdx) {
+                if (particleIdx != GUTParameters::InvalidParticleIdx) {
                     prefetchedParticlesData[tileThreadIdx] = {particleIdx, particles.fetchDensityParameters(particleIdx)};
                 } else {
-                    prefetchedParticlesData[tileThreadIdx].idx = threedgut::GUTParameters::InvalidParticleIdx;
+                    prefetchedParticlesData[tileThreadIdx].idx = GUTParameters::InvalidParticleIdx;
                 }
             } else {
-                prefetchedParticlesData[tileThreadIdx].idx = threedgut::GUTParameters::InvalidParticleIdx;
+                prefetchedParticlesData[tileThreadIdx].idx = GUTParameters::InvalidParticleIdx;
             }
             __syncthreads();
 
             // Process fetched particles
-            for (int j = 0; ray.isAlive() && j < min(threedgut::GUTParameters::Tiling::BlockSize, tileNumParticlesToProcess); j++) {
+            for (int j = 0; ray.isAlive() && j < min(GUTParameters::Tiling::BlockSize, tileNumParticlesToProcess); j++) {
 
                 const PrefetchedParticleData particleData = prefetchedParticlesData[j];
-                if (particleData.idx == threedgut::GUTParameters::InvalidParticleIdx) {
+                if (particleData.idx == GUTParameters::InvalidParticleIdx) {
                     i = tileNumBlocksToProcess;
                     break;
                 }
@@ -342,7 +342,7 @@ struct GUTKBufferRenderer : Params {
         static_assert(Params::KHitBufferSize == 0, "evalForwardNoKBufferBalanced only supports K=0 (no hit buffer). Use evalKBuffer for K>0 cases.");
         
         // Warp-aligned processing: round up to multiple of WarpSize to avoid divergence
-        constexpr uint32_t WarpSize = threedgut::GUTParameters::Tiling::WarpSize;  // 32 threads per warp
+        constexpr uint32_t WarpSize = GUTParameters::Tiling::WarpSize;  // 32 threads per warp
         uint32_t alignedParticleCount = ((tileNumParticlesToProcess + WarpSize - 1) / WarpSize) * WarpSize;
         
         // Main loop: Gaussian-wise parallelism - WarpSize threads process Gaussians, single ray
@@ -359,7 +359,7 @@ struct GUTKBufferRenderer : Params {
                 const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + j;
                 const uint32_t particleIdx = sortedTileParticleIdxPtr[toProcessSortedIndex];
                 
-                if (particleIdx != threedgut::GUTParameters::InvalidParticleIdx) {
+                if (particleIdx != GUTParameters::InvalidParticleIdx) {
                     auto densityParams = particles.fetchDensityParameters(particleIdx);
                     
                     if (particles.densityHit(ray.origin,
@@ -383,7 +383,7 @@ struct GUTKBufferRenderer : Params {
             }
                 
             // Skip if no hits in this warp batch
-            constexpr uint32_t WarpMask = threedgut::GUTParameters::Tiling::WarpMask;  // 0xFFFFFFFF for full warp
+            constexpr uint32_t WarpMask = GUTParameters::Tiling::WarpMask;  // 0xFFFFFFFF for full warp
             if (__all_sync(WarpMask, !validHit)) continue;
             
             // Step 2: Compute per-thread transmittance contribution
@@ -481,19 +481,19 @@ struct GUTKBufferRenderer : Params {
         static_assert(Backward && (Params::KHitBufferSize == 0), "Optimized path for backward pass with no KBuffer");
 
         using namespace threedgut;
-        __shared__ PrefetchedRawParticleData prefetchedRawParticlesData[threedgut::GUTParameters::Tiling::BlockSize];
+        __shared__ PrefetchedRawParticleData prefetchedRawParticlesData[GUTParameters::Tiling::BlockSize];
 
-        for (uint32_t i = 0; i < tileNumBlocksToProcess; i++, tileNumParticlesToProcess -= threedgut::GUTParameters::Tiling::BlockSize) {
+        for (uint32_t i = 0; i < tileNumBlocksToProcess; i++, tileNumParticlesToProcess -= GUTParameters::Tiling::BlockSize) {
 
             if (__syncthreads_and(!ray.isAlive())) {
                 break;
             }
 
             // Collectively fetch particle data
-            const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + i * threedgut::GUTParameters::Tiling::BlockSize + tileThreadIdx;
+            const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + i * GUTParameters::Tiling::BlockSize + tileThreadIdx;
             if (toProcessSortedIndex < tileParticleRangeIndices.y) {
                 const uint32_t particleIdx = sortedTileParticleIdxPtr[toProcessSortedIndex];
-                if (particleIdx != threedgut::GUTParameters::InvalidParticleIdx) {
+                if (particleIdx != GUTParameters::InvalidParticleIdx) {
                     prefetchedRawParticlesData[tileThreadIdx].densityParameters = particles.fetchDensityRawParameters(particleIdx);
                     if constexpr (Params::PerRayParticleFeatures) {
                         prefetchedRawParticlesData[tileThreadIdx].features = TFeaturesVec::zero();
@@ -502,22 +502,22 @@ struct GUTKBufferRenderer : Params {
                     }
                     prefetchedRawParticlesData[tileThreadIdx].idx = particleIdx;
                 } else {
-                    prefetchedRawParticlesData[tileThreadIdx].idx = threedgut::GUTParameters::InvalidParticleIdx;
+                    prefetchedRawParticlesData[tileThreadIdx].idx = GUTParameters::InvalidParticleIdx;
                 }
             } else {
-                prefetchedRawParticlesData[tileThreadIdx].idx = threedgut::GUTParameters::InvalidParticleIdx;
+                prefetchedRawParticlesData[tileThreadIdx].idx = GUTParameters::InvalidParticleIdx;
             }
             __syncthreads();
 
             // Process fetched particles
-            for (int j = 0; j < min(threedgut::GUTParameters::Tiling::BlockSize, tileNumParticlesToProcess); j++) {
+            for (int j = 0; j < min(GUTParameters::Tiling::BlockSize, tileNumParticlesToProcess); j++) {
 
-                if (__all_sync(threedgut::GUTParameters::Tiling::WarpMask, !ray.isAlive())) {
+                if (__all_sync(GUTParameters::Tiling::WarpMask, !ray.isAlive())) {
                     break;
                 }
 
                 const PrefetchedRawParticleData particleData = prefetchedRawParticlesData[j];
-                if (particleData.idx == threedgut::GUTParameters::InvalidParticleIdx) {
+                if (particleData.idx == GUTParameters::InvalidParticleIdx) {
                     ray.kill();
                     break;
                 }

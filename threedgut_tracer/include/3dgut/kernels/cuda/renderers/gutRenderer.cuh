@@ -133,7 +133,8 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
                                        const tcnn::uvec2 tileGrid) {
 
     // Static allocation: each block handles one virtual tile
-    constexpr uint32_t VirtualTilesPerTile = threedgut::GUTParameters::Tiling::VirtualTilesPerTile;
+    using namespace threedgut;
+    constexpr uint32_t VirtualTilesPerTile = GUTParameters::Tiling::VirtualTilesPerTile;
     const uint32_t virtual_tile_id = blockIdx.x;
 
     // Calculate total virtual tiles across all original tiles
@@ -150,10 +151,10 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
     const uint32_t original_tile_y = original_tile_id / tileGrid.x;
 
     // Map virtual tile to pixel coordinates within original tile
-    constexpr uint32_t VirtualTilesPerTileX = threedgut::GUTParameters::Tiling::VirtualTilesPerTileX;
-    constexpr uint32_t VirtualTileX = threedgut::GUTParameters::Tiling::VirtualTileX;
-    constexpr uint32_t VirtualTileY = threedgut::GUTParameters::Tiling::VirtualTileY;
-    constexpr uint32_t WarpSize = threedgut::GUTParameters::Tiling::WarpSize;
+    constexpr uint32_t VirtualTilesPerTileX = GUTParameters::Tiling::VirtualTilesPerTileX;
+    constexpr uint32_t VirtualTileX = GUTParameters::Tiling::VirtualTileX;
+    constexpr uint32_t VirtualTileY = GUTParameters::Tiling::VirtualTileY;
+    constexpr uint32_t WarpSize = GUTParameters::Tiling::WarpSize;
     
     const uint32_t virtual_tile_x = virtual_tile_in_original % VirtualTilesPerTileX;  // 0-7
     const uint32_t virtual_tile_y = virtual_tile_in_original / VirtualTilesPerTileX;  // 0-7
@@ -167,9 +168,9 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
     const uint32_t laneId = threadIdx.x % WarpSize;
 
     // Each block processes 1 virtual tile = VirtualTileSize pixels, each warp handles 1 pixel
-    constexpr uint32_t VirtualTileSize = threedgut::GUTParameters::Tiling::VirtualTileSize;
-    constexpr uint32_t BlockX = threedgut::GUTParameters::Tiling::BlockX;
-    constexpr uint32_t BlockY = threedgut::GUTParameters::Tiling::BlockY;
+    constexpr uint32_t VirtualTileSize = GUTParameters::Tiling::VirtualTileSize;
+    constexpr uint32_t BlockX = GUTParameters::Tiling::BlockX;
+    constexpr uint32_t BlockY = GUTParameters::Tiling::BlockY;
     
     if (warpId < VirtualTileSize) { // VirtualTileSize warps per block (1 warp per pixel)
         // Arrange pixels in row-major order within VirtualTileX x VirtualTileY region
