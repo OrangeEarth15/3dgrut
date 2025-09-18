@@ -82,7 +82,7 @@ def setup_3dgut(conf):
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
         "-use_fast_math", "-O3",
-        "-lineinfo",  # Add line info for NCU source-level profiling
+        "-lineinfo",  # Generate line-number information for SASS-to-source mapping in NCU
         *defines,
     ]
 
