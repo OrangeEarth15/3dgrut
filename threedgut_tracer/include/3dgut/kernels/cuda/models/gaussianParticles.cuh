@@ -1042,22 +1042,22 @@ __device__ inline void processHitBwd(
         // 特征系统 (particles.featuresIntegrateBwd 等价逻辑)
 
         
-        float3 grad;  // 存储球谐函数对视角方向的梯度
+        float3 grad;  // 存储球谐函数的randiance
         
         if constexpr (PerRayRadiance) {
             // 动态模式：实时计算球谐函数的反向传播
             
-            // 10.1 获取球谐系数（重现前向传播）
-            float3 sphCoefficients[PARTICLE_RADIANCE_NUM_COEFFS];
+            // 10.1 获取球谐系数，只是获取系数
+            float3 sphCoefficients[PARTICLE_RADIANCE_NUM_COEFFS]; // 9 or 16 coefficients
             fetchParticleSphCoefficients(
                 particleIdx,
                 particleRadiancePtr,
                 &sphCoefficients[0]);
             
-            // 10.2 球谐函数的反向传播
+            // 10.2 球谐函数的反向传播，里面有前向重计算
             // 【复杂计算】同时计算：
             // - 辐射度对球谐系数的梯度（存储到particleRadianceGradPtr）
-            // - 辐射度对视角方向的梯度（返回值grad，用于位置梯度计算）
+            // - 辐射度（返回值grad，用于位置梯度计算）
             grad = radianceFromSpHBwd<true>(
                 sphEvalDegree, 
                 &sphCoefficients[0], 
@@ -1105,6 +1105,7 @@ __device__ inline void processHitBwd(
         particleDensityGradPtr->density = gres * (
             galphaRayHitGrd +                                                     // 深度梯度贡献
             galphaRayDnsGrd +                                                     // 透射率梯度贡献
+            // 与步骤6的计算很相似
             transmittance * (grad.x - residualRayRad.x) * radianceGrad.x +        // R分量颜色梯度贡献
             transmittance * (grad.y - residualRayRad.y) * radianceGrad.y +        // G分量颜色梯度贡献
             transmittance * (grad.z - residualRayRad.z) * radianceGrad.z);        // B分量颜色梯度贡献
