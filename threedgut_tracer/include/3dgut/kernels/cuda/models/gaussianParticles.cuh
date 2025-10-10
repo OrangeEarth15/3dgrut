@@ -490,14 +490,14 @@ __device__ inline void processHitBwd(
     float minParticleAlpha,
     float minTransmittance,
     int32_t sphEvalDegree,
-    float integratedTransmittance,
-    float& transmittance,
+    float integratedTransmittance, // transmittanceBackward
+    float& transmittance, // transmittance
     float transmittanceGrad,
-    float3 integratedRadiance,
-    float3& radiance,
+    float3 integratedRadiance, // ray.featuresBackward
+    float3& radiance, // ray.features
     float3 radianceGrad,
-    float integratedDepth,
-    float& depth,
+    float integratedDepth, // ray.hitT
+    float& depth, // ray.hitTBackward
     float depthGrad) {
     float3 particlePosition;
     float3 gscl;
@@ -526,9 +526,9 @@ __device__ inline void processHitBwd(
 
     const float gres   = particleResponse<ParticleKernelDegree>(grayDist);
     const float galpha = fminf(0.99f, gres * particleDensity);
-
+    
     if ((gres > minParticleKernelDensity) && (galpha > minParticleAlpha)) {
-
+        
         const float3 grdd   = grd * (SurfelPrimitive ? -gro.z / grd.z : dot(grd, -1 * gro));
         const float3 grds   = gscl * grdd;
         const float gsqdist = dot(grds, grds);
@@ -551,6 +551,20 @@ __device__ inline void processHitBwd(
         //                        = (gdist - residualHitT) * prevTrm
         //
         const float galphaRayHitGrd = (gdist - residualHitT) * transmittance * depthGrad;
+        
+        // DEBUG: 只监控特定像素的所有粒子操作（原始版本）
+        // 监控像素(0,0)，对应warp版本的block 0 warp 0
+        const uint32_t debugPixelX = 0;
+        const uint32_t debugPixelY = 0;
+        const uint32_t currentPixelX = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint32_t currentPixelY = blockIdx.y * blockDim.y + threadIdx.y;
+        
+        // Debug output (commented out for production)
+        // if (currentPixelX == debugPixelX && currentPixelY == debugPixelY) {
+        //     const float nextTransmit = (1 - galpha) * transmittance;
+        //     printf("ORIG_PIXEL[%d,%d]: particleIdx=%d, galpha=%.8f, transmittance=%.8f, weight=%.8f, gdist=%.8f, nextTransmit=%.8f, residualHitT=%.8f, density=%.8f, gres=%.8f, grayDist=%.8f\n",
+        //            debugPixelX, debugPixelY, particleIdx, galpha, transmittance, weight, gdist, nextTransmit, residualHitT, particleDensity, gres, grayDist);
+        // }
         //
         // ===> d_hitT / d_gsqdist = weight / (2*gdist)
         // ===> d_gsqdist / d_grds =  2 * grds
@@ -656,7 +670,7 @@ __device__ inline void processHitBwd(
             groGrd = ghitPosGrd;
             grdGrd = ghitT * ghitPosGrd;
             // ===> d_ghitPos / d_ghitT = grd
-            const float ghitTGrd = sum(grd * ghitPosGrd);
+            const float ghitTGrd = grd.x * ghitPosGrd.x + grd.y * ghitPosGrd.y + grd.z * ghitPosGrd.z;
 
             // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             // ---> ghitT = -dot(surfelNm, gro) / dot(surfNm, grd)
@@ -732,9 +746,372 @@ __device__ inline void processHitBwd(
         particleDensityGradPtr->quaternion.y = grotGrdPoscr.y + grotGrdRayDirR.y;
         particleDensityGradPtr->quaternion.z = grotGrdPoscr.z + grotGrdRayDirR.z;
         particleDensityGradPtr->quaternion.w = grotGrdPoscr.w + grotGrdRayDirR.w;
-
+        
         transmittance = nextTransmit;
     }
+}
+
+template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false, bool PerRayRadiance = true, typename TRay, typename TFeaturesVec>
+__device__ inline void processWarpBackward(
+    // Ray和基本参数 - 现在使用共享内存中的ray
+    TRay* sharedRay,  // 改为指针，指向共享内存中的ray
+    const uint32_t WarpMask,
+    const int laneId,
+    
+    // 当前warp的粒子数据
+    const uint32_t globalParticleIdx,
+    const ParticleDensity& rawParams,
+    const TFeaturesVec& hitFeatures,
+    
+    // 渲染参数
+    const float minParticleKernelDensity,
+    const float minParticleAlpha,
+    const float minTransmittanceThreshold,
+    
+    // 输出：warp-level状态
+    bool& should_terminate,
+    int& termination_lane,
+    
+    // 输出：计算的梯度结果
+    ParticleDensity& densityRawParametersGrad,
+    TFeaturesVec& featuresGrad
+) {
+    constexpr uint32_t WarpSize = 32;
+    
+    // 所有线程都从共享内存读取ray状态
+    TRay& ray = *sharedRay;
+    
+    // 检查粒子是否有效，但不提前返回以保持warp同步
+    // InvalidParticleIdx 定义为 -1U (0xFFFFFFFFU)
+    const bool validParticle = (globalParticleIdx != 0xFFFFFFFFU);
+    
+    // ============================================================================
+    // STEP 1: 前向计算（内联processHitFwdOptimized的核心逻辑）
+    // ============================================================================
+    bool validHit = false;
+    
+
+    float3 particlePosition, particleScale, grdd, grds;
+    float33 particleRotation;
+    float4 grot;
+    float particleDensity, gsqdist, gdist;
+    
+    // 只有有效粒子才进行参数计算
+    if (validParticle) {
+        // 前向计算 - 使用与原始版本相同的参数处理方式
+        // 注意：这里需要获取处理后的参数，而不是原始参数
+        // 但由于函数签名限制，我们需要在这里重新处理
+        particlePosition = rawParams.position;
+        particleScale = rawParams.scale;
+        grot = rawParams.quaternion;
+        // 关键修复：使用与原始版本完全相同的旋转矩阵计算
+        // 原始版本的processHitBwd直接使用quaternionWXYZToMatrix（非转置）
+        quaternionWXYZToMatrix(grot, particleRotation);
+        particleDensity = rawParams.density;
+    } else {
+        // 无效粒子：初始化为默认值，不参与计算
+        particlePosition = make_float3(0.0f);
+        particleScale = make_float3(1.0f);  // 避免除零
+        particleRotation[0] = make_float3(1.0f, 0.0f, 0.0f);
+        particleRotation[1] = make_float3(0.0f, 1.0f, 0.0f);
+        particleRotation[2] = make_float3(0.0f, 0.0f, 1.0f);
+        grot = make_float4(1.0f, 0.0f, 0.0f, 0.0f);
+        particleDensity = 0.0f;
+    }
+    
+
+    // 提取ray参数，与原始processHitBwd保持一致
+    const float3 rayOrigin = reinterpret_cast<const float3&>(ray.origin);
+    const float3 rayDirection = reinterpret_cast<const float3&>(ray.direction);
+    
+    // 声明所有需要的变量，确保作用域正确
+    float gres = 0.0f, galpha = 0.0f, grayDist = 0.0f;
+    float3 giscl, gposc, gposcr, gro, rayDirR, grdu, grd, gcrod;
+    
+    // 只有有效粒子才进行几何计算
+    if (validParticle) {
+        // 几何变换 - 提取公共计算，避免重复
+        giscl = make_float3(1.0f / particleScale.x, 1.0f / particleScale.y, 1.0f / particleScale.z);
+        gposc = rayOrigin - particlePosition;
+        gposcr = gposc * particleRotation;
+        gro     = giscl * gposcr;
+        rayDirR = rayDirection * particleRotation;
+        grdu = giscl * rayDirR;
+        grd     = safe_normalize(grdu);
+
+        gcrod = SurfelPrimitive ? gro + grd * (-gro.z / grd.z) : cross(grd, gro);
+        grayDist = dot(gcrod, gcrod);
+
+        // 响应和alpha计算
+        gres   = particleResponse<ParticleKernelDegree>(grayDist);
+        galpha = fminf(0.99f, gres * particleDensity);
+
+        const bool acceptHit = (gres > minParticleKernelDensity) && (galpha > minParticleAlpha);
+        if (acceptHit) {
+            // 距离计算
+            grdd = grd * (SurfelPrimitive ? -gro.z / grd.z : dot(grd, -1 * gro));
+            grds = particleScale * grdd;
+            gsqdist = dot(grds, grds);
+            gdist = sqrtf(gsqdist);
+            
+            if ((gdist > ray.tMinMax.x) && (gdist < ray.tMinMax.y)) {
+                validHit = true;
+            }
+        }
+    } else {
+        // 无效粒子：设置默认值，不参与hit计算
+        giscl = make_float3(1.0f);
+        gposc = make_float3(0.0f);
+        gposcr = make_float3(0.0f);
+        gro = make_float3(0.0f);
+        rayDirR = make_float3(0.0f);
+        grdu = make_float3(0.0f);
+        grd = make_float3(0.0f);
+        gcrod = make_float3(0.0f);
+        grdd = make_float3(0.0f);
+        grds = make_float3(0.0f);
+        gsqdist = 0.0f;
+        gdist = 0.0f;
+    }
+    
+    // ============================================================================
+    // STEP 2: Warp-level early exit检查 - 注意：不能直接return，要保证warp协作
+    // ============================================================================
+    // 移除提前退出，让所有线程都参与后续的warp同步操作
+    
+    // ============================================================================
+    // STEP 3: Warp-level prefix scan for transmittance
+    // ============================================================================
+    float warpPrefixTransmittance = validHit ? (1.0f - galpha) : 1.0f;
+    
+    #pragma unroll
+    for (uint32_t offset = 1; offset < WarpSize; offset <<= 1) {
+        const float localTransmittance = __shfl_up_sync(WarpMask, warpPrefixTransmittance, offset);
+        if (laneId >= offset) {
+            warpPrefixTransmittance *= localTransmittance;
+        }
+    }
+    
+    // 获取不包括当前粒子的前缀透射率 - 所有线程都参与shuffle
+    // 所有线程都必须调用__shfl_sync，但只有需要的线程使用结果
+    const float prevLaneValue = __shfl_sync(WarpMask, warpPrefixTransmittance, 
+                                           laneId > 0 ? laneId - 1 : 0);
+    const float prefixTransmittanceExclusive = laneId > 0 ? prevLaneValue : 1.0f;
+    
+    // 提前终止检测
+    const unsigned int early_termination_mask = __ballot_sync(WarpMask, 
+        validHit && ray.transmittance * warpPrefixTransmittance < minTransmittanceThreshold);
+    
+    should_terminate = (early_termination_mask != 0);
+    if (should_terminate) {
+        termination_lane = __ffs(early_termination_mask) - 1;
+    }
+    
+    // ============================================================================
+    // STEP 4: 计算贡献和prefix scans
+    // ============================================================================
+    const bool should_contribute = validHit && (!should_terminate || laneId <= termination_lane);
+    
+    // 计算粒子透射率 - 使用正确的前缀透射率（不包括当前粒子）
+    const float particleTransmittance = validHit ? ray.transmittance * prefixTransmittanceExclusive : 0.0f;
+    
+    // 计算贡献
+    float accumulatedDepth = 0.0f;
+    TFeaturesVec accumulatedRadiance = TFeaturesVec::zero();
+    
+    if (should_contribute) {
+        const float hitWeight = galpha * particleTransmittance;
+        accumulatedDepth = gdist * hitWeight;
+        
+        #pragma unroll
+        for (int featIdx = 0; featIdx < 3; ++featIdx) { 
+            accumulatedRadiance[featIdx] = hitFeatures[featIdx] * hitWeight;
+        }
+    }
+    
+    // 累积值的prefix scan
+    #pragma unroll
+    for (uint32_t offset = 1; offset < WarpSize; offset <<= 1) {
+        const float depthUp = __shfl_up_sync(WarpMask, accumulatedDepth, offset);
+        if (laneId >= offset) accumulatedDepth += depthUp;
+        
+        #pragma unroll
+        for (int featIdx = 0; featIdx < 3; ++featIdx) {
+            const float radianceUp = __shfl_up_sync(WarpMask, accumulatedRadiance[featIdx], offset);
+            if (laneId >= offset) accumulatedRadiance[featIdx] += radianceUp;
+        }
+    }
+    
+    // ============================================================================
+    // STEP 5: 反向传播核心逻辑（内联processHitBwdOptimized的核心部分）
+    // ============================================================================
+    // 注意：梯度参数由调用方初始化，这里不重复初始化
+    
+    // DEBUG: 监控特定block中特定warp的所有lane操作 - 移到条件外面查看所有粒子
+    const uint32_t debugBlockId = 0;   // 监控第一个block
+    const uint32_t debugWarpId = 0;    // 监控该block中的第一个warp
+    const uint32_t currentWarpId = threadIdx.x / 32;  // 当前线程在block中的warp编号
+    
+    // Debug output (commented out for production)
+    // if (blockIdx.x == debugBlockId && currentWarpId == debugWarpId) {
+    //     const float weight = galpha * particleTransmittance;
+    //     const float nextTransmit = (1 - galpha) * particleTransmittance;
+    //     printf("BLOCK[%d]WARP[%d][lane%d]: particleIdx=%d, galpha=%.8f, particleTransmittance=%.8f, weight=%.8f, gdist=%.8f, nextTransmit=%.8f, validParticle=%d, validHit=%d, density=%.8f, gres=%.8f, grayDist=%.8f\n",
+    //            debugBlockId, debugWarpId, laneId, globalParticleIdx, galpha, particleTransmittance, weight, gdist, nextTransmit, validParticle ? 1 : 0, validHit ? 1 : 0, particleDensity, gres, grayDist);
+    // }
+    
+    if (validParticle && should_contribute && (gres > minParticleKernelDensity) && (galpha > minParticleAlpha)) {
+        const float weight = galpha * particleTransmittance;
+        const float nextTransmit = (1 - galpha) * particleTransmittance;
+        
+        // 反向传播计算：目标深度 - (当前累积深度 + 该warp累计到现在为止的贡献)
+        const float totalCurrentDepth = ray.hitT + accumulatedDepth;
+        const float residualHitT = fmaxf((nextTransmit <= minTransmittanceThreshold ? 0 : 
+            (ray.hitTBackward - totalCurrentDepth) / nextTransmit), 0);
+        
+        // 梯度计算 - 使用particleTransmittance，这就是当前粒子的正确透射率
+        const float galphaRayHitGrd = (gdist - residualHitT) * particleTransmittance * ray.hitTGradient;
+        const float3 grdsRayHitGrd = gsqdist > 0.0f ? 
+            ((2 * grds * weight) / (2 * gdist)) * ray.hitTGradient : make_float3(0.0f);
+        
+        const float3 gsclRayHitGrd = grdd * grdsRayHitGrd;
+        const float3 grdRayHitGrd = -particleScale * make_float3(
+            2 * grd.x * gro.x + grd.y * gro.y + grd.z * gro.z,
+            grd.x * gro.x + 2 * grd.y * gro.y + grd.z * gro.z,
+            grd.x * gro.x + grd.y * gro.y + 2 * grd.z * gro.z
+        ) * grdsRayHitGrd;
+        const float3 groRayHitGrd = -particleScale * grd * grd * grdsRayHitGrd;
+        
+        const float residualTrm = galpha < 0.999999f ? ray.transmittanceBackward / (1 - galpha) : particleTransmittance;
+        const float galphaRayDnsGrd = residualTrm * -ray.transmittanceGradient;
+        
+        // 辐射度梯度计算
+        float3 grad = make_float3(hitFeatures[0], hitFeatures[1], hitFeatures[2]);
+        if constexpr (!PerRayRadiance) {
+            // 简单辐射度情况的特征梯度
+            const float3 rayFeatGrad = make_float3(ray.featuresGradient[0], ray.featuresGradient[1], ray.featuresGradient[2]);
+            featuresGrad[0] = rayFeatGrad.x * weight;
+            featuresGrad[1] = rayFeatGrad.y * weight;
+            featuresGrad[2] = rayFeatGrad.z * weight;
+        } else {
+		// TODO
+	}
+        
+        // 反向传播计算：目标辐射 - (当前累积辐射 + 该warp累计到现在为止的贡献)
+        const float3 integratedRad = make_float3(ray.featuresBackward[0], ray.featuresBackward[1], ray.featuresBackward[2]);
+        const float3 totalCurrentRad = make_float3(ray.features[0] + accumulatedRadiance[0], 
+                                                   ray.features[1] + accumulatedRadiance[1], 
+                                                   ray.features[2] + accumulatedRadiance[2]);
+        const float3 residualRayRad = nextTransmit <= minTransmittanceThreshold ? make_float3(0) : make_float3(
+            fmaxf((integratedRad.x - totalCurrentRad.x) / nextTransmit, 0.0f),
+            fmaxf((integratedRad.y - totalCurrentRad.y) / nextTransmit, 0.0f),
+            fmaxf((integratedRad.z - totalCurrentRad.z) / nextTransmit, 0.0f)
+        );
+        
+        // 密度梯度 - 使用particleTransmittance，与原始processHitBwd保持一致
+        const float3 rayFeatGrad = make_float3(ray.featuresGradient[0], ray.featuresGradient[1], ray.featuresGradient[2]);        
+        densityRawParametersGrad.density = gres * (galphaRayHitGrd + galphaRayDnsGrd + 
+            particleTransmittance * (grad.x - residualRayRad.x) * rayFeatGrad.x +
+            particleTransmittance * (grad.y - residualRayRad.y) * rayFeatGrad.y +
+            particleTransmittance * (grad.z - residualRayRad.z) * rayFeatGrad.z);
+        
+        // 几何梯度计算 - 使用particleTransmittance，与原始processHitBwd保持一致
+        const float gresGrd = particleDensity * (galphaRayHitGrd + galphaRayDnsGrd + 
+            particleTransmittance * (grad.x - residualRayRad.x) * rayFeatGrad.x +
+            particleTransmittance * (grad.y - residualRayRad.y) * rayFeatGrad.y +
+            particleTransmittance * (grad.z - residualRayRad.z) * rayFeatGrad.z);
+
+        const float grayDistGrd = particleResponseGrd<ParticleKernelDegree>(grayDist, gres, gresGrd);
+
+        // 几何梯度计算
+        float3 grdGrd, groGrd;
+        if (SurfelPrimitive) {
+            // Surfel梯度逻辑
+            const float3 surfelNm = make_float3(0, 0, 1);
+            const float doSurfelGro = dot(surfelNm, gro);
+            const float dotSurfelGrd = dot(surfelNm, grd);
+            const float ghitT = -doSurfelGro / dotSurfelGrd;
+            const float3 ghitPos = gro + grd * ghitT;
+            const float3 ghitPosGrd = 2 * ghitPos * grayDistGrd;
+            groGrd = ghitPosGrd;
+            grdGrd = ghitT * ghitPosGrd;
+            const float ghitTGrd = grd.x * ghitPosGrd.x + grd.y * ghitPosGrd.y + grd.z * ghitPosGrd.z;
+            groGrd += (-surfelNm * ghitTGrd) / dotSurfelGrd;
+            const float dotSurfelGrdGrd = (doSurfelGro * ghitTGrd) / (dotSurfelGrd * dotSurfelGrd);
+            grdGrd += surfelNm * dotSurfelGrdGrd;
+        } else {
+            // 叉积梯度逻辑
+            const float3 gcrod = cross(grd, gro);
+            const float3 gcrodGrd = 2 * gcrod * grayDistGrd;
+            grdGrd = make_float3(gcrodGrd.z * gro.y - gcrodGrd.y * gro.z,
+                                 gcrodGrd.x * gro.z - gcrodGrd.z * gro.x,
+                                 gcrodGrd.y * gro.x - gcrodGrd.x * gro.y);
+            groGrd = make_float3(gcrodGrd.y * grd.z - gcrodGrd.z * grd.y,
+                                 gcrodGrd.z * grd.x - gcrodGrd.x * grd.z,
+                                 gcrodGrd.x * grd.y - gcrodGrd.y * grd.x);
+        }
+
+        // 最终参数梯度计算 - 使用已定义的公共变量
+        const float3 gsclGrdGro = make_float3((-gposcr.x / (particleScale.x * particleScale.x)),
+                                              (-gposcr.y / (particleScale.y * particleScale.y)),
+                                              (-gposcr.z / (particleScale.z * particleScale.z))) * (groGrd + groRayHitGrd);
+        const float3 gposcrGrd = giscl * (groGrd + groRayHitGrd);
+        const float3 gposcGrd = matmul_bw_vec(particleRotation, gposcrGrd);
+        const float4 grotGrdPoscr = matmul_bw_quat(gposc, gposcrGrd, grot);
+
+        // 位置梯度
+        densityRawParametersGrad.position = -gposcGrd;
+
+        // 缩放梯度 - 使用已定义的rayDirR变量
+        const float3 grduGrd = safe_normalize_bw(grdu, grdGrd + grdRayHitGrd);
+        densityRawParametersGrad.scale = gsclRayHitGrd + gsclGrdGro + (-rayDirR / (particleScale * particleScale)) * grduGrd;
+        const float3 rayDirRGrd = giscl * grduGrd;
+
+        // 四元数梯度
+        const float4 grotGrdRayDirR = matmul_bw_quat(rayDirection, rayDirRGrd, grot);
+        densityRawParametersGrad.quaternion.x = grotGrdPoscr.x + grotGrdRayDirR.x;
+        densityRawParametersGrad.quaternion.y = grotGrdPoscr.y + grotGrdRayDirR.y;
+        densityRawParametersGrad.quaternion.z = grotGrdPoscr.z + grotGrdRayDirR.z;
+        densityRawParametersGrad.quaternion.w = grotGrdPoscr.w + grotGrdRayDirR.w;
+        
+        // DEBUG: 输出最终梯度结果
+#ifdef DEBUG_GRADIENT_COMPARISON
+        if (isDebugPixel) {
+            printf("WARP_FINAL_GRAD[lane%d]: densityGrad=%.8f\n", laneId, densityRawParametersGrad.density);
+            printf("WARP_FINAL_GRAD[lane%d]: positionGrad=[%.8f,%.8f,%.8f]\n",
+                   laneId, densityRawParametersGrad.position.x, densityRawParametersGrad.position.y, densityRawParametersGrad.position.z);
+            printf("WARP_FINAL_GRAD[lane%d]: scaleGrad=[%.8f,%.8f,%.8f]\n",
+                   laneId, densityRawParametersGrad.scale.x, densityRawParametersGrad.scale.y, densityRawParametersGrad.scale.z);
+        }
+#endif
+    }
+    
+    // ============================================================================
+    // STEP 6: 更新共享内存中的ray状态
+    // ============================================================================
+    // 获取warp中最后一个线程的累积值
+    const float finalBatchTransmittance = __shfl_sync(WarpMask, warpPrefixTransmittance, WarpSize - 1);
+    const float totalDepthContribution = __shfl_sync(WarpMask, accumulatedDepth, WarpSize - 1);
+    
+    // 所有线程都参与__shfl_sync，获取特征的累积值
+    TFeaturesVec totalFeaturesContribution = TFeaturesVec::zero();
+    for (int featIdx = 0; featIdx < 3; ++featIdx) {
+        totalFeaturesContribution[featIdx] = __shfl_sync(WarpMask, accumulatedRadiance[featIdx], WarpSize - 1);
+    }
+    
+    // 只有lane 0更新共享内存中的ray状态
+    if (laneId == 0) {
+        sharedRay->transmittance *= finalBatchTransmittance;
+        sharedRay->hitT += totalDepthContribution;
+        
+        // 更新特征
+        for (int featIdx = 0; featIdx < 3; ++featIdx) {
+            sharedRay->features[featIdx] += totalFeaturesContribution[featIdx];
+        }
+    }
+    
+    // 确保所有线程都看到ray状态的更新
+    __syncwarp(WarpMask);
 }
 
 } // namespace threedgut

@@ -314,6 +314,8 @@ struct GUTKBufferRenderer : Params {
 
         using namespace threedgut;
         
+        static_assert(Params::KHitBufferSize == 0, "evalForwardNoKBufferBalanced only supports K=0 (no hit buffer). Use evalKBuffer for K>0 cases.");
+        
         // Get tile data: each warp processes particles from a single 16x16 tile
         const uint32_t tileIdx = tile.y * tileGrid.x + tile.x;
         const tcnn::uvec2 tileParticleRangeIndices = sortedTileRangeIndicesPtr[tileIdx];
@@ -331,15 +333,7 @@ struct GUTKBufferRenderer : Params {
         // Initialize particle system
         Particles particles;
         particles.initializeDensity(parameters);
-        if constexpr (Backward) {
-            particles.initializeDensityGradient(parametersGradient);
-        }
         particles.initializeFeatures(parameters);
-        if constexpr (Backward && Params::PerRayParticleFeatures) {
-            particles.initializeFeaturesGradient(parametersGradient);
-        }
-
-        static_assert(Params::KHitBufferSize == 0, "evalForwardNoKBufferBalanced only supports K=0 (no hit buffer). Use evalKBuffer for K>0 cases.");
         
         // Warp-aligned processing: round up to multiple of WarpSize to avoid divergence
         constexpr uint32_t WarpSize = GUTParameters::Tiling::WarpSize;  // 32 threads per warp
@@ -530,7 +524,9 @@ struct GUTKBufferRenderer : Params {
 
                 TFeaturesVec featuresGrad = TFeaturesVec::zero();
 
-                if (ray.isAlive()) {
+                if (ray.isAlive()) {   
+                    // 先 threedgut_tracer/include/3dgut/kernels/cuda/models/shRadiativeGaussianParticles.cuh
+                    // 再 threedgut_tracer/include/3dgut/kernels/cuda/models/gaussianParticles.cuh
                     particles.processHitBwd<Params::PerRayParticleFeatures>(
                         ray.origin,
                         ray.direction,
@@ -548,6 +544,7 @@ struct GUTKBufferRenderer : Params {
                         ray.hitT,
                         ray.hitTBackward,
                         ray.hitTGradient);
+                    
                     if (ray.transmittance < Particles::MinTransmittanceThreshold) {
                         ray.kill();
                     }
@@ -558,6 +555,140 @@ struct GUTKBufferRenderer : Params {
                                                                   particleFeaturesGradientBuffer, tileThreadIdx);
                 }
                 particles.processHitBwdUpdateDensityGradient(particleData.idx, densityRawParametersGrad, tileThreadIdx);
+            }
+        }
+    }
+
+
+    // Warp-per-pixel backward rendering: Self-contained evaluation with internal initialization
+    // Fine-grained balanced forward rendering: Gaussian-wise parallelism with warp-level optimization
+    template <typename TRay>
+    static inline __device__ void evalBackwardNoKBufferBalanced(
+                                       const threedgut::RenderParameters& params,
+                                       TRay* sharedRay,  // 改为指针，指向共享内存中的ray
+                                       const tcnn::uvec2* __restrict__ sortedTileRangeIndicesPtr,
+                                       const uint32_t* __restrict__ sortedTileParticleIdxPtr,
+                                       const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
+                                       const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
+                                       const float* __restrict__ particlesGlobalDepthPtr,
+                                       const float* __restrict__ particlesPrecomputedFeaturesPtr,
+                                       const tcnn::uvec2& tile,
+                                       const tcnn::uvec2& tileGrid,
+                                       const int laneId,
+                                       threedgut::MemoryHandles parameters,
+                                       tcnn::vec2* __restrict__ particlesProjectedPositionGradPtr     = nullptr,
+                                       tcnn::vec4* __restrict__ particlesProjectedConicOpacityGradPtr = nullptr,
+                                       float* __restrict__ particlesGlobalDepthGradPtr                = nullptr,
+                                       float* __restrict__ particlesPrecomputedFeaturesGradPtr        = nullptr,
+                                       threedgut::MemoryHandles parametersGradient                    = {}) {
+        using namespace threedgut;
+
+        static_assert(Backward && (Params::KHitBufferSize == 0), "Warp-per-pixel backward rendering");
+
+        // 所有线程都使用共享内存中的ray
+        TRay& ray = *sharedRay;
+
+        const uint32_t tileIdx = tile.y * tileGrid.x + tile.x;
+        const tcnn::uvec2 tileParticleRangeIndices   = sortedTileRangeIndicesPtr[tileIdx];
+        uint32_t tileNumParticlesToProcess           = tileParticleRangeIndices.y - tileParticleRangeIndices.x;
+        const TFeaturesVec* particleFeaturesBuffer   = Params::PerRayParticleFeatures ? nullptr : reinterpret_cast<const TFeaturesVec*>(particlesPrecomputedFeaturesPtr);
+        TFeaturesVec* particleFeaturesGradientBuffer = Params::PerRayParticleFeatures ? nullptr : reinterpret_cast<TFeaturesVec*>(particlesPrecomputedFeaturesGradPtr);
+
+        Particles particles;
+        particles.initializeDensity(parameters);
+        particles.initializeDensityGradient(parametersGradient);
+        particles.initializeFeatures(parameters);
+        if constexpr (Params::PerRayParticleFeatures) {
+            particles.initializeFeaturesGradient(parametersGradient);
+        }
+        
+        // WARP-PER-PIXEL STRATEGY: Each warp processes one pixel
+        // NOTE: Cannot use warp shuffle optimization for gradient accumulation
+        //       because each lane processes different particles with random indices.
+        //       Fall back to direct atomic operations (synchedThread=false).
+        constexpr uint32_t WarpSize = GUTParameters::Tiling::WarpSize;
+        const uint32_t WarpMask = GUTParameters::Tiling::WarpMask;
+        
+        // Process particles in batches of WarpSize
+        for (uint32_t batchStart = 0; batchStart < tileNumParticlesToProcess; batchStart += WarpSize) {
+            if (__all_sync(WarpMask, !sharedRay->isAlive())) break;
+            
+            const uint32_t j = batchStart + laneId;
+            uint32_t globalParticleIdx = GUTParameters::InvalidParticleIdx;
+            DensityRawParameters rawParams = {};
+            TFeaturesVec hitFeatures = TFeaturesVec::zero();
+            bool validParticle = false;
+            
+            if (j < tileNumParticlesToProcess) {
+                globalParticleIdx = sortedTileParticleIdxPtr[tileParticleRangeIndices.x + j];
+                
+                if (globalParticleIdx != GUTParameters::InvalidParticleIdx) {
+                    validParticle = true;
+                    rawParams = particles.fetchDensityRawParameters(globalParticleIdx);
+                    
+                    // 参考 evalBackwardNoKBuffer：预加载数据，让内部函数决定hit
+                    if constexpr (Params::PerRayParticleFeatures) {
+                        hitFeatures = TFeaturesVec::zero();  // 对于PerRayParticleFeatures，设为zero
+                    } else {
+                        hitFeatures = tcnn::max(particleFeaturesBuffer[globalParticleIdx], 0.f);
+                    }
+                }
+            }
+            
+            // 如果遇到无效粒子，检查是否应该提前终止整个warp处理
+            // 由于排序特性，无效粒子通常出现在末尾，可以提前终止
+            if (__all_sync(WarpMask, !validParticle)) {
+                break;  // 整个warp都是无效粒子，可以安全退出
+            }
+            
+            // Step 2: 所有线程都必须参与warp协作，即使没有有效粒子
+            bool should_terminate = false;
+            int termination_lane = -1;
+            // 显式初始化梯度参数，参考原始 evalBackwardNoKBuffer 的方式
+            DensityRawParameters densityRawParametersGrad;
+            densityRawParametersGrad.density    = 0.0f;
+            densityRawParametersGrad.position   = make_float3(0.0f);
+            densityRawParametersGrad.quaternion = make_float4(0.0f);
+            densityRawParametersGrad.scale      = make_float3(0.0f);
+            densityRawParametersGrad.padding    = 0.0f;
+            
+            TFeaturesVec featuresGrad = TFeaturesVec::zero();
+            
+            // All warp threads must call processWarpBackward for synchronization
+            threedgut::processWarpBackward<Particles::KernelDegree, false, Params::PerRayParticleFeatures>(
+                sharedRay,
+                WarpMask,
+                laneId,
+                globalParticleIdx,
+                reinterpret_cast<const ParticleDensity&>(rawParams),
+                hitFeatures,
+                Particles::MinParticleKernelDensity,
+                Particles::AlphaThreshold,
+                Particles::MinTransmittanceThreshold,
+                should_terminate,
+                termination_lane,
+                reinterpret_cast<ParticleDensity&>(densityRawParametersGrad),
+                featuresGrad
+            );
+            
+            // Update gradients directly with atomic operations (synchedThread=false)
+            // Cannot use warp shuffle because each lane has different particleIdx
+            if (validParticle) {
+                if constexpr (!Params::PerRayParticleFeatures) {
+                    particles.template processHitBwdUpdateFeaturesGradient<false>(
+                        globalParticleIdx, featuresGrad, particleFeaturesGradientBuffer, laneId);
+                }
+                particles.template processHitBwdUpdateDensityGradient<false>(
+                    globalParticleIdx, densityRawParametersGrad, laneId);
+            }
+            
+            // Check for early termination
+            // Note: ray state is updated inside processWarpBackward
+            if (should_terminate) {
+                if (laneId == 0) {
+                    sharedRay->kill();
+                }
+                break;
             }
         }
     }

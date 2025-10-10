@@ -56,3 +56,35 @@ __device__ __inline__ RayPayloadT initializeBackwardRay(const threedgut::RenderP
 
     return ray;
 }
+
+// Per-pixel backward ray initialization for optimized rendering
+template <typename RayPayloadT>
+__device__ __inline__ RayPayloadT initializeBackwardRayPerPixel(const threedgut::RenderParameters& params,
+                                                                const tcnn::uvec2& pixel,
+                                                                const tcnn::vec3* __restrict__ sensorRayOriginPtr,
+                                                                const tcnn::vec3* __restrict__ sensorRayDirectionPtr,
+                                                                const float* __restrict__ worldHitDistancePtr,
+                                                                const float* __restrict__ worldHitDistanceGradientPtr,
+                                                                const tcnn::vec<RayPayloadT::FeatDim + 1>* __restrict__ featuresDensityPtr,
+                                                                const tcnn::vec<RayPayloadT::FeatDim + 1>* __restrict__ featuresDensityGradientPtr,
+                                                                const tcnn::mat4x3& sensorToWorldTransform) {
+
+    // NB : no backpropagation through the forward ray initialization / finalization
+    RayPayloadT ray = initializeRayPerPixel<RayPayloadT>(params, pixel,
+                                                         sensorRayOriginPtr,
+                                                         sensorRayDirectionPtr,
+                                                         sensorToWorldTransform);
+
+    if (ray.isAlive()) {
+        const tcnn::vec<RayPayloadT::FeatDim + 1> featuresDensity         = featuresDensityPtr[ray.idx];
+        const tcnn::vec<RayPayloadT::FeatDim + 1> featuresDensityGradient = featuresDensityGradientPtr[ray.idx];
+        ray.transmittanceBackward                                         = 1.f - featuresDensity[RayPayloadT::FeatDim];
+        ray.transmittanceGradient                                         = -1.f * featuresDensityGradient[RayPayloadT::FeatDim];
+        ray.hitTBackward                                                  = worldHitDistancePtr[ray.idx];
+        ray.hitTGradient                                                  = worldHitDistanceGradientPtr[ray.idx];
+        ray.featuresBackward                                              = threedgut::sliceVec<0, RayPayloadT::FeatDim>(featuresDensity);
+        ray.featuresGradient                                              = threedgut::sliceVec<0, RayPayloadT::FeatDim>(featuresDensityGradient);
+    }
+
+    return ray;
+}

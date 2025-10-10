@@ -499,6 +499,35 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
         // cudaEventCreate(&stopEvent);
         // cudaEventRecord(startEvent, cudaStream);
         
+#if defined(BACKWARD_WARP_OPTIMIZATION) && BACKWARD_WARP_OPTIMIZATION
+        // Use warp-optimized backward rendering with virtual tile-based load balancing
+        const uint32_t total_virtual_tiles = tileGrid.x * tileGrid.y * GUTParameters::Tiling::VirtualTilesPerTile;
+        ::renderBackwardOptimized<<<total_virtual_tiles, GUTParameters::Tiling::VirtualTileSize * GUTParameters::Tiling::WarpSize, 0, cudaStream>>>(
+            params,
+            (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
+            (const uint32_t*)m_forwardContext->sortedTileParticleIdx.data(),
+            (const tcnn::vec3*)sensorRayOriginCudaPtr,
+            (const tcnn::vec3*)sensorRayDirectionCudaPtr,
+            sensorPoseToMat(sensorPoseInv),
+            (const float*)worldHitDistanceCudaPtr,             //
+            (const float*)worldHitDistanceGradientCudaPtr,     // TODO: not implemented yet
+            (const tcnn::vec4*)radianceDensityCudaPtr,         //
+            (const tcnn::vec4*)radianceDensityGradientCudaPtr, // TODO: not implemented yet
+            (tcnn::vec3*)worldRayOriginGradientCudaPtr,        // TODO: not implemented yet
+            (tcnn::vec3*)worldRayDirectionGradientCudaPtr,     // TODO: not implemented yet
+            (const tcnn::vec2*)m_forwardContext->particlesProjectedPosition.data(),
+            (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(),
+            (const float*)m_forwardContext->particlesGlobalDepth.data(),
+            (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
+            parameters.m_dptrParametersBuffer,
+            (tcnn::vec2*)m_forwardContext->particlesProjectedPositionGradient.data(),
+            (tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacityGradient.data(),
+            (float*)m_forwardContext->particlesGlobalDepthGradient.data(),
+            (float*)m_forwardContext->particlesPrecomputedFeaturesGradient.data(),
+            parameters.m_dptrGradientsBuffer,
+            tileGrid);
+#else
+        // Use standard backward rendering
         ::renderBackward<<<dim3{tileGrid.x, tileGrid.y, 1u}, dim3{GUTParameters::Tiling::BlockX, GUTParameters::Tiling::BlockY, 1u}, 0, cudaStream>>>(
             params,
             (const tcnn::uvec2*)m_forwardContext->sortedTileRangeIndices.data(),
@@ -522,6 +551,7 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
             (float*)m_forwardContext->particlesGlobalDepthGradient.data(),
             (float*)m_forwardContext->particlesPrecomputedFeaturesGradient.data(),
             parameters.m_dptrGradientsBuffer);
+#endif
         
         // cudaEventRecord(stopEvent, cudaStream);
         // cudaEventSynchronize(stopEvent);
