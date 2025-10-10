@@ -207,8 +207,11 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
                                             {parameterMemoryHandles});
 
         // Write final results to output buffers
-        finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, 
-                    worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
+        // Only lane 0 should write, as only it has accumulated the correct values
+        if (laneId == 0) {
+            finalizeRay(ray, params, sensorRayOriginPtr, worldHitCountPtr, 
+                        worldHitDistancePtr, radianceDensityPtr, sensorToWorldTransform);
+        }
     }
 }
 
